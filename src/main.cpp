@@ -1,6 +1,8 @@
 /**
  * @file main.cpp
  * @brief GNSS 数据流驱动与 SPP 在线定位程序
+ * @author Unknown
+ * @date Unknown
  *
  * 工程职责划分：
  * - main.cpp：负责二进制数据流读取、解码器驱动、结果落盘与宏观统计输出。
@@ -18,6 +20,10 @@
 #include <gnss_positioning/NovatelDecoder.h>
 #include <gnss_positioning/SPP.h>
 
+/**
+ * @brief 程序入口：驱动数据解码与单点定位解算，并将历元结果输出到文件
+ * @return 0: 正常退出；非 0: 异常退出
+ */
 int main() {
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "GNSS SPP 定位程序" << std::endl;

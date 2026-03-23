@@ -1,9 +1,10 @@
 /**
  * @file NavMath.h
  * @brief GNSS 基础数学库头文件
- * 
- * 包含坐标系统转换（WGS84）和时间系统转换（UTC/GPST/MJD）的结构体定义与接口声明。
- * 遵循测绘与导航工程通用规范。
+ * @author Unknown
+ * @date Unknown
+ *
+ * 包含时间系统转换（UTC/GPST/MJD）与坐标系统转换（WGS84）相关的数据结构与接口声明。
  */
 
 #ifndef NAVMATH_H
@@ -17,7 +18,7 @@
 namespace gnss {
 
 /**
- * @brief 通用时间结构体 (Common Time)
+ * @brief 通用时间结构体
  * 对应民用习惯的年月日时分秒表示，通常用于表示 UTC 或本地时间。
  */
 struct COMMONTIME {
@@ -30,8 +31,8 @@ struct COMMONTIME {
 };
 
 /**
- * @brief 简化儒略日结构体 (Modified Julian Date, MJD)
- * 将儒略日 (JD) 减去 2400000.5 天，起始历元为 1858年11月17日0时。
+ * @brief 简化儒略日结构体（MJD）
+ * 将儒略日（JD）减去 2400000.5 天，起始历元为 1858年11月17日 00:00:00。
  */
 struct MJDTIME {
     int Days;       ///< MJD 整数部分 (天数)
@@ -41,9 +42,9 @@ struct MJDTIME {
 };
 
 /**
- * @brief GPS 时间结构体 (GPS Time, GPST)
+ * @brief GPS 时间结构体（GPST）
  * 卫星导航系统内部时间参考，由 GPS 周和周内秒组成。
- * 起始历元为 1980年1月6日0时 (UTC)。
+ * 起始历元为 1980年1月6日 00:00:00（UTC）。
  */
 struct GPSTIME {
     unsigned short Week; ///< GPS 周 (从 0 开始计数)
@@ -53,8 +54,8 @@ struct GPSTIME {
 };
 
 /**
- * @brief 地心空间直角坐标结构体 (ECEF XYZ)
- * 参考系：WGS84 (World Geodetic System 1984)
+ * @brief 地心空间直角坐标结构体（ECEF XYZ）
+ * 参考系：WGS84
  * 单位：米 (m)
  */
 struct XYZ {
@@ -64,87 +65,93 @@ struct XYZ {
 };
 
 /**
- * @brief 大地坐标结构体 (Geodetic BLH)
+ * @brief 大地坐标结构体（BLH）
  * 参考系：WGS84 椭球体
  */
 struct BLH {
-    double longitude; ///< 经度 (Longitude, L)，单位：弧度 (rad)，正值为东经
-    double latitude;  ///< 纬度 (Latitude, B)，单位：弧度 (rad)，正值为北纬
-    double height;    ///< 大地高 (Ellipsoidal Height, H)，单位：米 (m)
+    double longitude; ///< 经度 L，单位：弧度 (rad)，正值为东经
+    double latitude;  ///< 纬度 B，单位：弧度 (rad)，正值为北纬
+    double height;    ///< 大地高 H，单位：米 (m)
 };
 
-/* --- 时间转换接口 (Time Conversion Interfaces) --- */
+/* --- 时间转换接口 --- */
 
 /**
  * @brief 通用时间转简化儒略日 (COMMONTIME -> MJD)
- * @param[in] commonTime 输入通用时间
- * @param[out] mjdTime 输出简化儒略日
- * @return 0: 成功; 1: 输入参数不合法 (如月份越界)
+ * @param commonTime 输入通用时间
+ * @param mjdTime 输出简化儒略日
+ * @return 0: 成功；1: 输入参数不合法（例如月份越界）
  */
 int CommonTimeToMjdTime(const COMMONTIME& commonTime, MJDTIME& mjdTime);
 
 /**
  * @brief 简化儒略日转通用时间 (MJD -> COMMONTIME)
- * @param[in] mjdTime 输入简化儒略日
- * @param[out] commonTime 输出通用时间
- * @return 0: 成功; 1: 失败
+ * @param mjdTime 输入简化儒略日
+ * @param commonTime 输出通用时间
+ * @return 0: 成功；1: 失败
  */
 int MjdTimeToCommonTime(const MJDTIME& mjdTime, COMMONTIME& commonTime);
 
 /**
  * @brief 简化儒略日转 GPS 时间 (MJD -> GPST)
- * @param[in] mjdTime 输入简化儒略日
- * @param[out] gpsTime 输出 GPS 时间
- * @return 0: 成功; 1: 时间早于 GPS 起始历元
+ * @param mjdTime 输入简化儒略日
+ * @param gpsTime 输出 GPS 时间
+ * @return 0: 成功；1: 时间早于 GPS 起始历元
  */
 int MjdTimeToGpsTime(const MJDTIME& mjdTime, GPSTIME& gpsTime);
 
 /**
  * @brief GPS 时间转简化儒略日 (GPST -> MJD)
- * @param[in] gpsTime 输入 GPS 时间
- * @param[out] mjdTime 输出简化儒略日
- * @return 0: 成功; 1: 输入周内秒越界
+ * @param gpsTime 输入 GPS 时间
+ * @param mjdTime 输出简化儒略日
+ * @return 0: 成功；1: 输入周内秒越界
  */
 int GpsTimeToMjdTime(const GPSTIME& gpsTime, MJDTIME& mjdTime);
 
 /**
  * @brief 通用时间转 GPS 时间 (COMMONTIME -> GPST)
+ * @param commonTime 输入通用时间
+ * @param gpsTime 输出 GPS 时间
+ * @return 0: 成功；1: 失败
  */
 int CommonTimeToGpsTime(const COMMONTIME& commonTime, GPSTIME& gpsTime);
 
 /**
  * @brief GPS 时间转通用时间 (GPST -> COMMONTIME)
+ * @param gpsTime 输入 GPS 时间
+ * @param commonTime 输出通用时间
+ * @return 0: 成功；1: 失败
  */
 int GpsTimeToCommonTime(const GPSTIME& gpsTime, COMMONTIME& commonTime);
 
-/* --- 坐标转换接口 (Coordinate Conversion Interfaces) --- */
+/* --- 坐标转换接口 --- */
 
 /**
  * @brief WGS84 大地坐标转地心空间直角坐标 (BLH -> XYZ)
  * 采用标准椭球投影公式计算。
- * @param[in] blh 输入大地坐标 (rad, rad, m)
- * @param[out] xyz 输出空间直角坐标 (m)
- * @return 0: 成功; 1: 纬度输入越界
+ * @param blh 输入大地坐标（longitude/latitude 为弧度，height 为米）
+ * @param xyz 输出空间直角坐标（ECEF，单位：米）
+ * @return 0: 成功；1: 纬度输入越界
  */
 int BLHToXYZ(const BLH& blh, XYZ& xyz);
 
 /**
  * @brief WGS84 地心空间直角坐标转大地坐标 (XYZ -> BLH)
  * 采用迭代法计算纬度，收敛阈值为 1e-12。
- * @param[in] xyz 输入空间直角坐标 (m)
- * @param[out] blh 输出大地坐标 (rad, rad, m)
- * @return 0: 成功; 1: 坐标位于地心附近导致无法计算
+ * @param xyz 输入空间直角坐标（ECEF，单位：米）
+ * @param blh 输出大地坐标（longitude/latitude 为弧度，height 为米）
+ * @return 0: 成功；1: 坐标位于地心附近导致无法计算
  */
 int XYZToBLH(const XYZ& xyz, BLH& blh);
 
 /**
  * @brief 地心空间直角坐标转站心坐标 (XYZ -> ENU)
- * @param[in] origin_xyz 测站的 ECEF 坐标
- * @param[in] target_xyz 目标的 ECEF 坐标
- * @param[out] E East 方向分量
- * @param[out] N North 方向分量
- * @param[out] U Up 方向分量
- * @return 0: 成功; 1: 失败
+ * @param origin_xyz 测站的 ECEF 坐标
+ * @param target_xyz 目标的 ECEF 坐标
+ * @param E 东向分量
+ * @param N 北向分量
+ * @param U 天向分量
+ * @return 0: 成功；1: 失败
  */
 int XyzToEnu(const XYZ& origin_xyz, const XYZ& target_xyz, double& E, double& N, double& U);
 

@@ -1,3 +1,10 @@
+/**
+ * @file SPP.h
+ * @brief 标准单点定位（SPP）核心接口与数据结构声明
+ * @author Unknown
+ * @date Unknown
+ */
+
 #ifndef SPP_H
 #define SPP_H
 
@@ -9,22 +16,24 @@
 namespace gnss {
 
 /**
- * @brief 物理常数与系统常数（工程级统一定义）
+ * @brief SPP 计算所需的物理常数与系统常数
+ *
+ * 统一常量定义用于保证各模块计算口径一致，避免出现单位或数值版本不一致导致的系统性偏差。
  */
 struct SppConst {
     static constexpr double C = 299792458.0;               ///< 光速 (m/s)
     static constexpr double OMEGA_E = 7.2921151467e-5;     ///< 地球自转角速度 (rad/s)
-    static constexpr double MU_GPS = 3.986005e14;          ///< GPS 引力常数 (m^3/s^2)
-    static constexpr double MU_BDS = 3.986004418e14;       ///< BDS 引力常数 (m^3/s^2)
-    static constexpr double F_REL = -4.442807633e-10;      ///< 相对论改正系数 (s/m^0.5)
-    static constexpr double WEEK_SEC = 604800.0;           ///< 周秒
-    static constexpr double HALF_WEEK = 302400.0;          ///< 半周秒
-    static constexpr double BDT_GPS_OFFSET = 14.0;         ///< GPST = BDT + 14s (当前有效，课程数据通常采用该常量)
+    static constexpr double MU_GPS = 3.986005e14;          ///< GPS 地球引力常数 (m^3/s^2)
+    static constexpr double MU_BDS = 3.986004418e14;       ///< BDS 地球引力常数 (m^3/s^2)
+    static constexpr double F_REL = -4.442807633e-10;      ///< 相对论改正系数 F (s/m^0.5)
+    static constexpr double WEEK_SEC = 604800.0;           ///< 一周秒数 (s)
+    static constexpr double HALF_WEEK = 302400.0;          ///< 半周秒数 (s)
+    static constexpr double BDT_GPS_OFFSET = 14.0;         ///< 时间系统常量：GPST = BDT + 14s（用于将 BDT 统一到 GPST）
 
-    static constexpr double GPS_L1 = 1575.42e6;
-    static constexpr double GPS_L2 = 1227.60e6;
-    static constexpr double BDS_B1I = 1561.098e6;
-    static constexpr double BDS_B3I = 1268.52e6;
+    static constexpr double GPS_L1 = 1575.42e6;            ///< GPS L1 载波频率 (Hz)
+    static constexpr double GPS_L2 = 1227.60e6;            ///< GPS L2 载波频率 (Hz)
+    static constexpr double BDS_B1I = 1561.098e6;          ///< BDS B1I 载波频率 (Hz)
+    static constexpr double BDS_B3I = 1268.52e6;           ///< BDS B3I 载波频率 (Hz)
 };
 
 /**
@@ -32,8 +41,8 @@ struct SppConst {
  * @note toe/toc 为周内秒，系统时间基准可能不同：GPS 为 GPST，BDS 为 BDT。
  */
 struct Ephemeris {
-    GnssSystem system;
-    uint32_t prn;
+    GnssSystem system;        ///< 卫星所属系统
+    uint32_t prn;             ///< 卫星 PRN 号
 
     double toe;               ///< 星历参考时刻 (s)
     double toc;               ///< 钟差参考时刻 (s)
@@ -51,7 +60,7 @@ struct Ephemeris {
     double m0;                ///< M0 (rad)
     double dN;                ///< Δn (rad/s)
 
-    double cuc, cus, crc, crs, cic, cis;
+    double cuc, cus, crc, crs, cic, cis; ///< 广播星历二阶谐波改正项
 };
 
 /**
@@ -68,27 +77,31 @@ struct SppSolution {
  * @note 该结构体用于让 main.cpp 保持“应用层”职责：只做数据流驱动与文件输出，不承担 SPP 领域逻辑判断。
  */
 struct SppEpochReport {
-    double tow_gpst = 0.0;
-    int obs_g = 0;
-    int obs_b = 0;
-    int eph_g = 0;
-    int eph_b = 0;
-    int match_g = 0;
-    int match_b = 0;
-    bool attempted = false;
-    bool ok = false;
-    XYZ pos = {0.0, 0.0, 0.0};
-    double clk_gps_m = 0.0;
-    double isb_bds_m = 0.0;
+    double tow_gpst = 0.0;    ///< 历元接收时刻（GPST 周内秒）
+    int obs_g = 0;            ///< GPS 观测卫星数量（按主频点统计）
+    int obs_b = 0;            ///< BDS 观测卫星数量（按主频点统计）
+    int eph_g = 0;            ///< GPS 星历条目数量
+    int eph_b = 0;            ///< BDS 星历条目数量
+    int match_g = 0;          ///< GPS 观测与星历匹配数量
+    int match_b = 0;          ///< BDS 观测与星历匹配数量
+    bool attempted = false;   ///< 是否满足基本条件并实际进入解算流程
+    bool ok = false;          ///< 是否解算成功
+    XYZ pos = {0.0, 0.0, 0.0};///< 解算得到的接收机 ECEF 坐标 (m)
+    double clk_gps_m = 0.0;   ///< 解算得到的 GPS 接收机钟差 (m)
+    double isb_bds_m = 0.0;   ///< 解算得到的 BDS 相对 GPS 的系统间偏差 (m)
 };
 
 /**
  * @brief GPS 广播星历结构体转换为 SPP 统一星历结构体
+ * @param gps_eph 输入的 GPS 广播星历
+ * @return 统一格式的星历结构体
  */
 Ephemeris ConvertFromGpsEphem(const GpsEphem& gps_eph);
 
 /**
  * @brief BDS 广播星历结构体转换为 SPP 统一星历结构体
+ * @param bds_eph 输入的 BDS 广播星历
+ * @return 统一格式的星历结构体
  */
 Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph);
 
@@ -103,56 +116,169 @@ Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph);
  */
 class SPP {
 public:
+    /**
+     * @brief 构造 SPP 解算器并初始化默认参数
+     * @return 无
+     */
     SPP();
 
+    /**
+     * @brief 执行单历元 SPP 解算
+     * @param t_rx_gpst 接收时刻（GPST 周内秒）
+     * @param obsList 观测数据列表（同一历元）
+     * @param ephList 广播星历列表（可包含多系统/多卫星）
+     * @return true: 解算成功；false: 解算失败或数据不足
+     */
     bool compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const std::vector<Ephemeris>& ephList);
     /**
      * @brief 执行单历元定位并输出报告（用于落盘与工程诊断）
      * @note 与 compute() 相同的解算逻辑，但会额外输出观测/星历/匹配/是否尝试等关键信息，避免 main.cpp 承担定位领域逻辑。
+     * @param t_rx_gpst 接收时刻（GPST 周内秒）
+     * @param obsList 观测数据列表（同一历元）
+     * @param ephList 广播星历列表（可包含多系统/多卫星）
+     * @param report 输出的历元报告
+     * @return true: 解算成功；false: 解算失败或数据不足
      */
     bool computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsList, const std::vector<Ephemeris>& ephList, SppEpochReport& report);
 
+    /**
+     * @brief 获取当前解算的接收机坐标（ECEF）
+     * @return {X, Y, Z}，单位：米 (m)
+     */
     std::vector<double> getPosition() const;
+    /**
+     * @brief 获取当前解算的接收机钟差（GPS，距离量纲）
+     * @return 接收机钟差 c*dt_r，单位：米 (m)
+     */
     double getReceiverClockBias() const;
+    /**
+     * @brief 获取当前解算的系统间偏差（BDS 相对 GPS）
+     * @return 系统间偏差，单位：米 (m)
+     */
     double getBdsIsbMeters() const { return sol_.isb_bds_m; }
 
+    /**
+     * @brief 设置运行时输出开关
+     * @param enable true: 输出调试信息；false: 静默运行
+     * @return 无
+     */
     void setVerbose(bool enable) { verbose_ = enable; }
+    /**
+     * @brief 设置高度角掩码
+     * @param deg 掩码角度，单位：度 (deg)
+     * @return 无
+     */
     void setElevationMaskDeg(double deg) { elev_mask_deg_ = deg; }
+    /**
+     * @brief 设置 SNR 掩码
+     * @param snr 最小 SNR，单位：dB-Hz
+     * @return 无
+     */
     void setSnrMaskDbHz(double snr) { snr_mask_dbhz_ = snr; }
+    /**
+     * @brief 设置是否启用无电离层组合伪距
+     * @param enable true: 使用双频无电离层组合（可用时）；false: 使用单频伪距
+     * @return 无
+     */
     void setEnableIonoFree(bool enable) { enable_iono_free_ = enable; }
 
 private:
+    /**
+     * @brief 解算前的观测预处理结果（单星单观测）
+     */
     struct ProcObs {
-        GnssSystem system;
-        uint32_t prn;
+        GnssSystem system;    ///< 观测所属系统
+        uint32_t prn;         ///< 卫星 PRN 号
         double P;             ///< 参与解算的伪距 (m)（可为无电离层组合）
-        double snr;
-        bool iono_free;
+        double snr;           ///< 观测信噪比（用于质量控制）
+        bool iono_free;       ///< 是否为无电离层组合观测
     };
 
+    /**
+     * @brief 单颗卫星的中间计算结果（用于构建观测方程与质量控制）
+     */
     struct SatCalc {
-        GnssSystem system;
-        uint32_t prn;
-        XYZ pos_ecef;
+        GnssSystem system;    ///< 卫星所属系统
+        uint32_t prn;         ///< 卫星 PRN 号
+        XYZ pos_ecef;         ///< 卫星 ECEF 坐标 (m)
         double clk_s;         ///< 卫星钟差 (s)
-        double elev_rad;
+        double elev_rad;      ///< 高度角 (rad)
         XYZ los;              ///< 单位视线向量
         double rho;           ///< 几何距离 (m)
         double tropo_m;        ///< 对流层延迟 (m)
         double P_corr;         ///< 观测伪距 + c*dt_s (m)
-        bool valid;
+        bool valid;           ///< 中间量是否有效
     };
 
+    /**
+     * @brief 将时间差归一化到半周范围内
+     * @param dt 输入时间差，单位：秒 (s)
+     * @return 归一化后的时间差，单位：秒 (s)
+     */
     static double normalizeTimeSec(double dt);
+    /**
+     * @brief 生成系统与 PRN 的哈希键（用于容器索引）
+     * @param sys 卫星系统
+     * @param prn 卫星 PRN 号
+     * @return 组合后的键值
+     */
     static uint32_t makeKey(GnssSystem sys, uint32_t prn);
 
+    /**
+     * @brief 将星历时间系统统一到 GPST
+     * @param eph 输入星历
+     * @return 时间系统已统一后的星历
+     */
     Ephemeris normalizeEphemerisToGpSt(const Ephemeris& eph) const;
 
+    /**
+     * @brief 观测预处理与筛选（单星最佳观测选取与质量控制）
+     * @param obsList 输入观测列表（同一历元）
+     * @return 预处理后的观测列表
+     */
     std::vector<ProcObs> preprocessObservations(const std::vector<ObsData>& obsList) const;
+    /**
+     * @brief 由接收时刻与伪距计算信号发射时刻近似值
+     * @param t_rx_gpst 接收时刻（GPST 周内秒）
+     * @param pseudorange_m 伪距观测值，单位：米 (m)
+     * @return 发射时刻（GPST 周内秒）
+     */
     double computeTransmitTime(double t_rx_gpst, double pseudorange_m) const;
+    /**
+     * @brief 计算卫星钟差（广播星历模型）
+     * @param eph_gpst 时间系统已统一为 GPST 的星历
+     * @param t_tx_gpst 发射时刻（GPST 周内秒）
+     * @param clk_s 输出的卫星钟差，单位：秒 (s)
+     * @return true: 计算成功；false: 输入不在有效时间范围或数值异常
+     */
     bool computeSatelliteClock(const Ephemeris& eph_gpst, double t_tx_gpst, double& clk_s) const;
+    /**
+     * @brief 计算卫星 ECEF 位置（广播星历模型）
+     * @param eph_gpst 时间系统已统一为 GPST 的星历
+     * @param t_tx_gpst 发射时刻（GPST 周内秒）
+     * @param sat_pos_ecef 输出的卫星 ECEF 坐标，单位：米 (m)
+     * @param Ek_out 输出的偏近点角 Ek（用于相对论改正或诊断）
+     * @return true: 计算成功；false: 输入不在有效时间范围或数值异常
+     */
     bool computeSatellitePosition(const Ephemeris& eph_gpst, double t_tx_gpst, XYZ& sat_pos_ecef, double& Ek_out) const;
+    /**
+     * @brief 地球自转改正（Sagnac 效应）对卫星坐标的影响
+     * @param sat_pos_ecef 输入/输出的卫星 ECEF 坐标（会被原地修正）
+     * @param transit_time_s 信号传播时间，单位：秒 (s)
+     * @return 无
+     */
     void applyEarthRotationCorrection(XYZ& sat_pos_ecef, double transit_time_s) const;
+    /**
+     * @brief 构建最小二乘解算所需的观测方程中间量
+     * @param t_rx_gpst 接收时刻（GPST 周内秒）
+     * @param procObs 预处理后的观测列表
+     * @param ephList 星历列表
+     * @param rx_pos 接收机坐标初值/当前值（ECEF）
+     * @param clk_gps_m 接收机钟差（GPS，距离量纲）
+     * @param isb_bds_m 系统间偏差（BDS 相对 GPS，距离量纲）
+     * @param satCalcs 输出的卫星中间量列表
+     * @return true: 成功构建且至少存在一颗有效卫星；false: 构建失败或无可用卫星
+     */
     bool buildObservationEquation(double t_rx_gpst,
                                  const std::vector<ProcObs>& procObs,
                                  const std::vector<Ephemeris>& ephList,
@@ -160,7 +286,21 @@ private:
                                  double clk_gps_m,
                                  double isb_bds_m,
                                  std::vector<SatCalc>& satCalcs) const;
+    /**
+     * @brief Saastamoinen 对流层延迟模型（简化形式）
+     * @param rx_blh 接收机大地坐标（WGS84）
+     * @param elev_rad 卫星高度角，单位：弧度 (rad)
+     * @return 对流层延迟，单位：米 (m)
+     */
     double computeTroposphereSaastamoinen(const BLH& rx_blh, double elev_rad) const;
+    /**
+     * @brief 最小二乘法求解状态增量
+     * @param sats 有效卫星中间量列表
+     * @param dx 输出的状态增量向量
+     * @param v 输出的加权残差向量
+     * @param H 输出的加权设计矩阵
+     * @return true: 求解成功；false: 求解失败或结果非有限数
+     */
     bool solveLeastSquares(const std::vector<SatCalc>& sats,
                            Eigen::VectorXd& dx,
                            Eigen::VectorXd& v,

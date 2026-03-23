@@ -1,3 +1,10 @@
+/**
+ * @file SPP.cpp
+ * @brief 标准单点定位（SPP）实现：观测预处理、广播星历解算与最小二乘迭代
+ * @author Unknown
+ * @date Unknown
+ */
+
 #include "gnss_positioning/SPP.h"
 #include<set>
 #include <map>
@@ -7,15 +14,17 @@
 #include <limits>
 
 #ifndef M_PI
+// 兼容性处理：部分编译环境未提供 M_PI 宏定义。
 #define M_PI 3.14159265358979323846
 #endif
 
 namespace gnss {
 
+// 角度转弧度。
 static double deg2rad(double deg) { return deg * M_PI / 180.0; }
 
 Ephemeris ConvertFromGpsEphem(const GpsEphem& gps_eph) {
-    // 工程约定：在 main.cpp 层面缓存的是解码器原始结构体，这里提供统一转换函数，避免在 main.cpp 中掺杂定位领域字段映射细节
+    // 工程约束：解码器输出结构体作为“输入数据模型”在应用层缓存；字段映射在此集中处理，避免应用层掺入定位领域细节。
     Ephemeris eph;
     eph.system = GnssSystem::GPS;
     eph.prn = gps_eph.prn;
@@ -44,7 +53,9 @@ Ephemeris ConvertFromGpsEphem(const GpsEphem& gps_eph) {
 }
 
 Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph) {
-    // 注意：BDS 星历的 rootA 已为 sqrt(a)，tgd 取 TGD1（B1I）
+    // BDS 字段口径说明：
+    // - rootA 为 sqrt(a)（与 GPS 的 majaxis 不同）
+    // - tgd 取 TGD1（B1I 频点）
     Ephemeris eph;
     eph.system = GnssSystem::BDS;
     eph.prn = bds_eph.prn;
@@ -73,9 +84,9 @@ Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph) {
 }
 
 SPP::SPP() : max_iter_(10), conv_m_(1e-4), elev_mask_deg_(10.0), snr_mask_dbhz_(30.0), enable_iono_free_(true), verbose_(false) {
-    // 初始值策略（工程经验）：
-    // - 初始坐标给一个地表附近的合理值，避免从地心 (0,0,0) 出发导致几何矩阵病态
-    // - 初始钟差/系统间偏差置零，由最小二乘迭代收敛
+    // 初值策略：
+    // - 位置初值选择地表附近的合理坐标，降低从 (0,0,0) 出发造成的几何退化风险
+    // - 钟差与系统间偏差置零，由迭代估计吸收
     sol_.pos.x = -2267749.0;
     sol_.pos.y = 5009355.0;
     sol_.pos.z = 3221234.0;
@@ -92,7 +103,7 @@ double SPP::getReceiverClockBias() const {
 }
 
 double SPP::normalizeTimeSec(double dt) {
-    // 周跳修正：将时间差限制到 [-302400, +302400]，避免跨周导致的 tk/dt 畸变
+    // 周界归一化：将时间差限制到 [-302400, +302400]，避免跨周引起 tk/dt 量级突变并污染轨道与钟差计算。
     if (dt > SppConst::HALF_WEEK) dt -= SppConst::WEEK_SEC;
     if (dt < -SppConst::HALF_WEEK) dt += SppConst::WEEK_SEC;
     return dt;
@@ -106,9 +117,9 @@ Ephemeris SPP::normalizeEphemerisToGpSt(const Ephemeris& eph) const {
     Ephemeris out = eph;
     if (out.system == GnssSystem::BDS) {
         // 时间系统统一（核心约束）：
-        // - 解算内部统一使用 GPST
-        // - BDS 广播星历 toe/toc 若为 BDT，则转换到 GPST：t_gps = t_bds + 14s
-        // - 禁止在“发射时刻 t_tx”阶段做系统时间偏移；系统间差异在观测方程中由 ISB 建模
+        // - 解算内部统一采用 GPST 作为时间基准
+        // - 若 toe/toc 为 BDT，则转换到 GPST：t_gps = t_bds + 14s
+        // - 不在发射时刻求解阶段引入系统时间偏移；系统差异通过观测方程中的 ISB 建模
         out.toe += SppConst::BDT_GPS_OFFSET;
         out.toc += SppConst::BDT_GPS_OFFSET;
         while (out.toe >= SppConst::WEEK_SEC) out.toe -= SppConst::WEEK_SEC;
@@ -121,9 +132,9 @@ Ephemeris SPP::normalizeEphemerisToGpSt(const Ephemeris& eph) const {
 
 std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>& obsList) const {
     // 五步法-第1步：观测预处理
-    // - 选取单星最佳观测（同一频点取最高 SNR）
-    // - SNR 掩码剔除低质量观测
-    // - 支持双频无电离层组合（优先），以抑制电离层误差导致的高度方向漂移
+    // - 单星观测聚合：同一频点保留最高 SNR 的伪距，降低多路径与跟踪噪声风险
+    // - 质量控制：应用 SNR 掩码剔除低质量观测
+    // - 双频策略：可用时优先采用无电离层组合，以抑制电离层一阶误差对解算（尤其高度分量）的主导影响
     struct FreqObs {
         bool has0 = false;
         bool has1 = false;
@@ -176,8 +187,8 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
         po.P = fo.P0;
 
         if (enable_iono_free_ && fo.has1) {
-            // 无电离层组合伪距（Iono-Free）：
-            // P_IF = (f1^2*P1 - f2^2*P2) / (f1^2 - f2^2)
+            // 无电离层组合伪距（Iono-Free，一阶电离层项抵消）：
+            // P_IF = (f1^2 * P(f1) - f2^2 * P(f2)) / (f1^2 - f2^2)
             double f1 = 0.0;
             double f2 = 0.0;
             if (fo.sys == GnssSystem::GPS) {
@@ -208,7 +219,7 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
 double SPP::computeTransmitTime(double t_rx_gpst, double pseudorange_m) const {
     // 五步法-第2步：计算信号发射时刻
     // t_tx = t_rx - ρ/c
-    // 这里的 ρ 用观测伪距近似（工程常用的初值），随后会用卫星钟差对 t_tx 做一次迭代修正
+    // 以观测伪距近似几何距离作为初值；随后通过卫星钟差对发射时刻进行二次修正以提高一致性。
     return t_rx_gpst - pseudorange_m / SppConst::C;
 }
 
@@ -304,7 +315,7 @@ bool SPP::computeSatellitePosition(const Ephemeris& eph_gpst, double t_tx_gpst, 
 
 void SPP::applyEarthRotationCorrection(XYZ& sat_pos_ecef, double transit_time_s) const {
     // Sagnac 效应（地球自转改正）：
-    // 将卫星在传播时间内的地球自转影响折算到 ECEF 坐标中（绕 Z 轴旋转）
+    // 在信号传播时间内，地球自转导致惯性系与地固系存在相对旋转；该项以绕 Z 轴旋转近似补偿到 ECEF 坐标中。
     double angle = SppConst::OMEGA_E * transit_time_s;
     double x_new = sat_pos_ecef.x * std::cos(angle) + sat_pos_ecef.y * std::sin(angle);
     double y_new = -sat_pos_ecef.x * std::sin(angle) + sat_pos_ecef.y * std::cos(angle);
@@ -314,7 +325,7 @@ void SPP::applyEarthRotationCorrection(XYZ& sat_pos_ecef, double transit_time_s)
 
 double SPP::computeTroposphereSaastamoinen(const BLH& rx_blh, double elev_rad) const {
     // 五步法-第4步：对流层改正 T（Saastamoinen 简化模型）
-    // 工程假设：标准大气 + 相对湿度固定，映射函数近似 1/sin(elev)
+    // 近似假设：采用标准大气参数并固定相对湿度；映射函数用 1/sin(elev) 的下限形式以增强低高度角数值稳定性。
     if (!(elev_rad > 0.0)) return 0.0;
     double h = rx_blh.height;
     if (!std::isfinite(h)) h = 0.0;
@@ -376,7 +387,8 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
 
         double clk_s = 0.0;
         if (!computeSatelliteClock(eph, t_tx, clk_s)) continue;
-        // 发射时刻二次修正（工程级做法）：
+        // 发射时刻二次修正：
+        // 将卫星钟差显式引入发射时刻估计，可降低钟差与轨道计算的耦合误差。
         // t_tx = t_rx - P/c - dt_s
         t_tx = t_rx_gpst - (o.P / SppConst::C) - clk_s;
         if (!computeSatelliteClock(eph, t_tx, clk_s)) continue;
@@ -505,7 +517,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
         }
 
         if (iter > 0) {
-            // 异常值剔除（工程约束）：|残差| > 100m 的观测剔除
+            // 异常值控制：采用固定阈值对大残差观测进行剔除，避免单颗异常卫星主导迭代更新。
             std::vector<SatCalc> filtered;
             filtered.reserve(sats.size());
             for (const auto& s : sats) {
@@ -561,7 +573,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
 }
 
 bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsList, const std::vector<Ephemeris>& ephList, SppEpochReport& report) {
-    // 工程化定位入口：对每个 RANGE 历元输出一行报告，用于落盘统计与问题回溯
+    // 工程化入口：对每个 RANGE 历元输出一行报告，用于结果落盘、统计与问题回溯。
     report = SppEpochReport{};
     report.tow_gpst = t_rx_gpst;
 
