@@ -1,8 +1,8 @@
 /**
  * @file main.cpp
  * @brief GNSS 数据流驱动与 SPP 在线定位程序
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-23
  *
  * 工程职责划分：
  * - main.cpp：负责二进制数据流读取、解码器驱动、结果落盘与宏观统计输出。

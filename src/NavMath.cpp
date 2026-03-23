@@ -1,8 +1,8 @@
 /**
  * @file NavMath.cpp
  * @brief GNSS 基础数学计算库实现
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-15
  *
  * 本文件实现时间系统转换与坐标系统转换的基础算法，作为定位解算模块的通用数学支撑。
  */

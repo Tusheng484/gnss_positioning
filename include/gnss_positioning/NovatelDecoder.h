@@ -1,8 +1,8 @@
 /**
  * @file NovatelDecoder.h
  * @brief NovAtel OEM 接收机数据解码模块头文件
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-20
  *
  * 本模块实现对 NovAtel OEM4/6/7 系列接收机 OEM 二进制协议的解析。
  * 主要功能包括：

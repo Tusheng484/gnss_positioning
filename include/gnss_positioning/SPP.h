@@ -1,8 +1,8 @@
 /**
  * @file SPP.h
  * @brief 标准单点定位（SPP）核心接口与数据结构声明
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-25
  */
 
 #ifndef SPP_H

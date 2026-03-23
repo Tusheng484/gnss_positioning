@@ -1,8 +1,8 @@
 /**
  * @file NavMath.h
  * @brief GNSS 基础数学库头文件
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-15
  *
  * 包含时间系统转换（UTC/GPST/MJD）与坐标系统转换（WGS84）相关的数据结构与接口声明。
  */

@@ -1,8 +1,8 @@
 /**
  * @file SPP.cpp
  * @brief 标准单点定位（SPP）实现：观测预处理、广播星历解算与最小二乘迭代
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-25
  */
 
 #include "gnss_positioning/SPP.h"

@@ -1,8 +1,8 @@
 /**
  * @file NovatelDecoder.cpp
  * @brief NovAtel OEM 协议解析模块实现
- * @author Unknown
- * @date Unknown
+ * @author Jiaoyang Wu
+ * @date 2026-03-20
  *
  * 核心逻辑：
  * 1. 帧同步：搜索 0xAA 0x44 0x12 同步序列。
