@@ -1,0 +1,7 @@
+.vscode/
+build/
+bin/
+third_party/eigen/
+*.21G
+*.21L
+Novatel OEM7 Data/
