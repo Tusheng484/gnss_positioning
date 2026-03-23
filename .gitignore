@@ -5,3 +5,12 @@ third_party/eigen/
 *.21G
 *.21L
 Novatel OEM7 Data/
+# 忽略编译产物
+build/
+bin/
+*.exe
+
+# 忽略解算输出和日志
+output/
+*.txt
+*.log
