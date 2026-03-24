@@ -129,6 +129,7 @@ void NovatelDecoder::decodeRange() {
         obs.prn = getUint16(p);                    // 字节偏移 0
         obs.pseudorange = getDouble(p + 4);        // 字节偏移 4，单位：m
         obs.carrierPhase = getDouble(p + 16);      // 字节偏移 16，单位：cycle
+        if (obs.carrierPhase < 0.0) obs.carrierPhase = -obs.carrierPhase;
         obs.doppler = getFloat(p + 28);            // 字节偏移 28，单位：Hz
         obs.snr = getFloat(p + 32);                // 字节偏移 32，单位：dB-Hz
         uint32_t channelStatus = getUint32(p + 40); // 字节偏移 40：通道跟踪状态
