@@ -38,6 +38,76 @@ int main() {
         return static_cast<uint32_t>(sys) * 1000U + prn;
     };
 
+    auto normalizeBdsTimeToGpSt = [](double t) -> double {
+        double out = t + gnss::SppConst::BDT_GPS_OFFSET;
+        while (out >= gnss::SppConst::WEEK_SEC) out -= gnss::SppConst::WEEK_SEC;
+        while (out < 0.0) out += gnss::SppConst::WEEK_SEC;
+        return out;
+    };
+
+    auto normalizeEphemerisToGpSt = [&](const gnss::Ephemeris& eph) -> gnss::Ephemeris {
+        gnss::Ephemeris out = eph;
+        if (out.system == gnss::GnssSystem::BDS) {
+            out.toe = normalizeBdsTimeToGpSt(out.toe);
+            out.toc = normalizeBdsTimeToGpSt(out.toc);
+        }
+        return out;
+    };
+
+    auto toGpsEph = [](const gnss::Ephemeris& eph) -> gnss::GpsEph {
+        gnss::GpsEph out;
+        out.prn = eph.prn;
+        out.toc = eph.toc;
+        out.toe = eph.toe;
+        out.af0 = eph.af0;
+        out.af1 = eph.af1;
+        out.af2 = eph.af2;
+        out.tgd = eph.tgd;
+        out.sqrtA = eph.rootA;
+        out.e = eph.ecc;
+        out.i0 = eph.inc0;
+        out.iDot = eph.inc_dot;
+        out.Omega0 = eph.omega0;
+        out.OmegaDot = eph.omega_dot;
+        out.omega = eph.argper;
+        out.M0 = eph.m0;
+        out.deltaN = eph.dN;
+        out.cuc = eph.cuc;
+        out.cus = eph.cus;
+        out.crc = eph.crc;
+        out.crs = eph.crs;
+        out.cic = eph.cic;
+        out.cis = eph.cis;
+        return out;
+    };
+
+    auto toBdsEph = [](const gnss::Ephemeris& eph) -> gnss::BdsEph {
+        gnss::BdsEph out;
+        out.prn = eph.prn;
+        out.toc = eph.toc;
+        out.toe = eph.toe;
+        out.af0 = eph.af0;
+        out.af1 = eph.af1;
+        out.af2 = eph.af2;
+        out.tgd = eph.tgd;
+        out.sqrtA = eph.rootA;
+        out.e = eph.ecc;
+        out.i0 = eph.inc0;
+        out.iDot = eph.inc_dot;
+        out.Omega0 = eph.omega0;
+        out.OmegaDot = eph.omega_dot;
+        out.omega = eph.argper;
+        out.M0 = eph.m0;
+        out.deltaN = eph.dN;
+        out.cuc = eph.cuc;
+        out.cus = eph.cus;
+        out.crc = eph.crc;
+        out.crs = eph.crs;
+        out.cic = eph.cic;
+        out.cis = eph.cis;
+        return out;
+    };
+
     std::string inputPath = "D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log";
     std::ifstream inFile(inputPath, std::ios::binary);
     if (!inFile.is_open()) {
@@ -57,6 +127,16 @@ int main() {
     outFile << std::setprecision(3);
     outFile << "TOW OBS_G OBS_B EPH_G EPH_B MATCH_G MATCH_B ATTEMPT OK X(m) Y(m) Z(m) CLK_GPS(m) ISB_BDS(m)" << std::endl;
 
+    std::string satOutPath = "D:/gnss_positioning/output/sat_states.txt";
+    std::ofstream satFile(satOutPath);
+    if (!satFile.is_open()) {
+        std::cerr << "[ERROR] 无法创建输出文件: " << satOutPath << std::endl;
+        return 1;
+    }
+    satFile << "TOW_RX(s)\tSYS\tPRN\tFREQIDX\tSNR(dBHz)\tP(m)\tT_TX(s)\tDT_PROP(s)\t"
+               "X(m)\tY(m)\tZ(m)\tVX(m/s)\tVY(m/s)\tVZ(m/s)\tCLK(s)\tCLK_DOT(s/s)\tEPH_EXPIRED\tVALID"
+            << std::endl;
+
     uint32_t totalBytes = 0;
     uint32_t rangeFrameCount = 0;
     uint32_t gpsEphCount = 0;
@@ -71,6 +151,10 @@ int main() {
     double lastOkTow = 0.0;
     std::vector<double> lastOkPos;
     double lastOkClk = 0.0;
+    uint64_t satCalcTotal = 0;
+    uint64_t satCalcNoEph = 0;
+    uint64_t satCalcOk = 0;
+    uint64_t satCalcValid = 0;
 
     uint8_t byte;
     while (inFile.read(reinterpret_cast<char*>(&byte), 1)) {
@@ -87,13 +171,79 @@ int main() {
             } else if (msgId == 1696) { // BDSEPHEMERIS
                 const auto& bds_eph = decoder.getBdsEphem();
                 if (bds_eph.prn >= 1 && bds_eph.prn <= 63) {
-                    ephStore[makeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = gnss::ConvertFromBdsEphem(bds_eph);
+                    gnss::Ephemeris eph = gnss::ConvertFromBdsEphem(bds_eph);
+                    ephStore[makeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = normalizeEphemerisToGpSt(eph);
                     bdsEphCount++;
                 }
             } else if (msgId == 43) { // RANGE
                 rangeFrameCount++;
                 double tow = decoder.getTow();
                 const auto& obsList = decoder.getObsData();
+
+                for (const auto& obs : obsList) {
+                    if (!(obs.pseudorange > 0.0)) continue;
+                    satCalcTotal++;
+
+                    auto it = ephStore.find(makeKey(obs.system, obs.prn));
+                    if (it == ephStore.end()) {
+                        satCalcNoEph++;
+                        continue;
+                    }
+                    const gnss::Ephemeris& eph = it->second;
+
+                    double dt_prop = obs.pseudorange / gnss::SppConst::C;
+                    double t_tx = tow - dt_prop;
+
+                    gnss::SatState st0;
+                    bool ok0 = false;
+                    if (obs.system == gnss::GnssSystem::GPS) {
+                        gnss::GpsEph e = toGpsEph(eph);
+                        ok0 = gnss::ComputeGpsSatState(e, t_tx, 0.0, st0);
+                    } else if (obs.system == gnss::GnssSystem::BDS) {
+                        gnss::BdsEph e = toBdsEph(eph);
+                        ok0 = gnss::ComputeBdsSatState(e, t_tx, 0.0, st0);
+                    }
+                    if (!ok0) continue;
+
+                    t_tx = tow - dt_prop - st0.clk_s;
+
+                    gnss::SatState st;
+                    bool ok = false;
+                    if (obs.system == gnss::GnssSystem::GPS) {
+                        gnss::GpsEph e = toGpsEph(eph);
+                        ok = gnss::ComputeGpsSatState(e, t_tx, dt_prop, st);
+                    } else if (obs.system == gnss::GnssSystem::BDS) {
+                        gnss::BdsEph e = toBdsEph(eph);
+                        ok = gnss::ComputeBdsSatState(e, t_tx, dt_prop, st);
+                    }
+                    if (!ok) continue;
+
+                    satCalcOk++;
+                    if (st.valid) satCalcValid++;
+
+                    char sysChar = 'U';
+                    if (obs.system == gnss::GnssSystem::GPS) sysChar = 'G';
+                    else if (obs.system == gnss::GnssSystem::BDS) sysChar = 'C';
+
+                    satFile << std::fixed << std::setprecision(3)
+                            << tow << "\t"
+                            << sysChar << "\t"
+                            << obs.prn << "\t"
+                            << obs.freqIdx << "\t"
+                            << static_cast<double>(obs.snr) << "\t"
+                            << obs.pseudorange << "\t"
+                            << t_tx << "\t"
+                            << dt_prop << "\t"
+                            << std::setprecision(3)
+                            << st.pos_ecef.x << "\t" << st.pos_ecef.y << "\t" << st.pos_ecef.z << "\t"
+                            << std::setprecision(6)
+                            << st.vel_ecef.x << "\t" << st.vel_ecef.y << "\t" << st.vel_ecef.z << "\t"
+                            << std::scientific << std::setprecision(16)
+                            << st.clk_s << "\t" << st.clk_drift << "\t"
+                            << std::fixed << std::setprecision(0)
+                            << (st.eph_expired ? 1 : 0) << "\t" << (st.valid ? 1 : 0)
+                            << std::endl;
+                }
                 
                 // 执行定位解算
                 std::vector<gnss::Ephemeris> currentEphList;
@@ -142,6 +292,10 @@ int main() {
               << " SPP_FAIL=" << sppFailCount
               << " SKIP_NO_EPH=" << skipNoEphCount
               << " SKIP_LOW_MATCH=" << skipLowMatchCount
+              << " SAT_TOTAL=" << satCalcTotal
+              << " SAT_NO_EPH=" << satCalcNoEph
+              << " SAT_OK=" << satCalcOk
+              << " SAT_VALID=" << satCalcValid
               << std::endl;
 
     if (hasFirstOk && lastOkPos.size() == 3) {
@@ -150,6 +304,7 @@ int main() {
                   << " LAST_OK_CLK(m)=" << lastOkClk << std::endl;
     }
     std::cout << "OUTPUT=" << outPath << std::endl;
+    std::cout << "SAT_OUTPUT=" << satOutPath << std::endl;
 
     return 0;
 }
