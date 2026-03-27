@@ -13,17 +13,25 @@
 namespace gnss {
 namespace {
 
+// 周界常量：用于 tk/dt 的跨周归一化。
 constexpr double kHalfWeekSec = 302400.0;
 constexpr double kWeekSec = 604800.0;
 
+// 引力常数（不同星座不得混用）。
 constexpr double kMuGps = 3.986005e14;
 constexpr double kMuBds = 3.986004418e14;
+
+// 地球自转角速度：为保证与现有工程口径一致，这里采用 SPP 模块使用的 ωe 数值。
 constexpr double kOmegaE = 7.2921151467e-5;
+
+// 相对论改正常数：Δtr = F * e * sqrt(A) * sin(E)。
 constexpr double kRelF = -4.442807633e-10;
 
+// 星历有效期阈值：用于输出 eph_expired 标志。
 constexpr double kGpsEphValidSec = 7200.0;
 constexpr double kBdsEphValidSec = 3600.0;
 
+// 速度计算采用中心差分：用有限差分避免引入新的解析推导口径，从而保持重构前后数值一致性。
 constexpr double kVelDiffDtSec = 0.5;
 
 inline bool IsFinite(double x) {
@@ -31,12 +39,15 @@ inline bool IsFinite(double x) {
 }
 
 double NormalizeWeekCrossover(double dt_sec) {
+    // 周跳修正：将时间差限制到 [-302400, +302400]，避免跨周导致 tk/dt 畸变。
     if (dt_sec > kHalfWeekSec) dt_sec -= kWeekSec;
     if (dt_sec < -kHalfWeekSec) dt_sec += kWeekSec;
     return dt_sec;
 }
 
 void SolveKeplerE(double Mk, double ecc, double& Ek) {
+    // 开普勒方程迭代：E - e*sin(E) = M。
+    // 迭代次数与收敛阈值保持与原 SPP 实现一致，以确保结果可复现。
     Ek = Mk;
     for (int i = 0; i < 10; ++i) {
         double f = Ek - ecc * std::sin(Ek) - Mk;
@@ -48,6 +59,7 @@ void SolveKeplerE(double Mk, double ecc, double& Ek) {
 }
 
 void ApplyEarthRotationCorrection(Vec3& sat_pos_ecef, double transit_time_s) {
+    // 地球自转改正（Sagnac）：传播时间内地固系绕 Z 轴旋转，按小角度近似直接旋转卫星坐标。
     double angle = kOmegaE * transit_time_s;
     double x_new = sat_pos_ecef.x * std::cos(angle) + sat_pos_ecef.y * std::sin(angle);
     double y_new = -sat_pos_ecef.x * std::sin(angle) + sat_pos_ecef.y * std::cos(angle);
@@ -70,6 +82,8 @@ bool ComputeSatelliteClockCommon(double mu,
                                 double& clk_s,
                                 double& clk_drift,
                                 double& Ek_out) {
+    // 卫星钟差模型（广播星历）：
+    // clk = af0 + af1*dt + af2*dt^2 + Δtr - TGD，其中 Δtr 为相对论效应改正。
     double dt = NormalizeWeekCrossover(t_tx - toc);
     if (std::abs(dt) > kHalfWeekSec) return false;
 
@@ -90,6 +104,7 @@ bool ComputeSatelliteClockCommon(double mu,
 
     double denom = 1.0 - ecc * std::cos(Ek);
     if (std::abs(denom) > 0.0) {
+        // 钟速包含相对论效应改正的一阶导数项：Δṫr = F * e * sqrt(A) * cos(E) * Ė。
         double E_dot = n / denom;
         double relativity_dot = kRelF * ecc * rootA * std::cos(Ek) * E_dot;
         clk_drift = af1 + 2.0 * af2 * dt + relativity_dot;
@@ -121,6 +136,8 @@ bool ComputeSatellitePositionCommon(double mu,
                                    double cis,
                                    Vec3& sat_pos_ecef,
                                    double& Ek_out) {
+    // 广播星历卫星位置计算（按教材/ICD 五步法）：
+    // 轨道平面坐标 -> 升交点赤经旋转 -> ECEF。
     double tk = NormalizeWeekCrossover(t_tx - toe);
     if (std::abs(tk) > kHalfWeekSec) return false;
 
@@ -135,9 +152,11 @@ bool ComputeSatellitePositionCommon(double mu,
     double sinE = std::sin(Ek);
     double cosE = std::cos(Ek);
 
+    // 真近点角使用 atan2 保证象限正确。
     double vk = std::atan2(std::sqrt(1.0 - ecc * ecc) * sinE, cosE - ecc);
     double uk = vk + argper;
 
+    // 二阶谐波摄动改正项：用于补偿轨道参数的周期性误差。
     double sin2u = std::sin(2.0 * uk);
     double cos2u = std::cos(2.0 * uk);
     double du = cus * sin2u + cuc * cos2u;
@@ -152,6 +171,7 @@ bool ComputeSatellitePositionCommon(double mu,
     double x_orb = r * std::cos(uk);
     double y_orb = r * std::sin(uk);
 
+    // 升交点赤经：包含地球自转项（-ωe*toe）与 Ωdot 修正。
     double Omega = omega0 + (omega_dot - kOmegaE) * tk - kOmegaE * toe;
 
     sat_pos_ecef.x = x_orb * std::cos(Omega) - y_orb * std::cos(i) * std::sin(Omega);
@@ -182,6 +202,8 @@ bool ComputeVelocityByCentralDiff(double mu,
                                  double cis,
                                  double transit_time_s,
                                  Vec3& vel_ecef) {
+    // 速度采用中心差分近似：v(t) ≈ (p(t+Δt) - p(t-Δt)) / (2Δt)。
+    // 该策略用于避免引入解析速度推导后带来的实现口径差异。
     Vec3 p_plus;
     Vec3 p_minus;
     double Ek_dummy = 0.0;
@@ -210,6 +232,7 @@ bool ComputeVelocityByCentralDiff(double mu,
 bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s, SatState& state) {
     state = SatState{};
 
+    // 星历有效性：仅用于输出标志位，调用方可选择是否剔除。
     double tk = NormalizeWeekCrossover(t_gpst - eph.toe);
     state.eph_expired = (std::abs(tk) > kGpsEphValidSec);
 
@@ -241,6 +264,7 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
 bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, SatState& state) {
     state = SatState{};
 
+    // 星历有效性：仅用于输出标志位，调用方可选择是否剔除。
     double tk = NormalizeWeekCrossover(t_bdt - eph.toe);
     state.eph_expired = (std::abs(tk) > kBdsEphValidSec);
 

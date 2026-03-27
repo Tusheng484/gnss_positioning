@@ -24,6 +24,8 @@ namespace gnss {
 // 角度转弧度。
 static double deg2rad(double deg) { return deg * M_PI / 180.0; }
 
+// 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
+// 该映射仅做字段搬运，不引入任何单位换算，以保持重构前后计算口径一致。
 static GpsEph ToGpsEph(const Ephemeris& eph) {
     GpsEph out;
     out.prn = eph.prn;
@@ -51,6 +53,8 @@ static GpsEph ToGpsEph(const Ephemeris& eph) {
     return out;
 }
 
+// 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
+// BDS 的 toe/toc 时间系统转换由 SPP 内部 normalizeEphemerisToGpSt() 负责完成。
 static BdsEph ToBdsEph(const Ephemeris& eph) {
     BdsEph out;
     out.prn = eph.prn;
@@ -338,8 +342,11 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         if (it == ephMap.end()) continue;
         const auto& eph = it->second;
 
+        // 发射时刻初值：以观测伪距近似几何距离（工程常用的初值策略）。
         double t_tx = computeTransmitTime(t_rx_gpst, o.P);
 
+        // 计算卫星钟差并对发射时刻进行二次修正。
+        // 此处不引入地球自转改正：与原实现一致，钟差与轨道解算在发射时刻层面解耦处理。
         SatState st0;
         if (o.system == GnssSystem::GPS) {
             GpsEph gps_eph = ToGpsEph(eph);
@@ -353,6 +360,8 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         // 将卫星钟差显式引入发射时刻估计，可降低钟差与轨道计算的耦合误差。
         // t_tx = t_rx - P/c - dt_s
         t_tx = t_rx_gpst - (o.P / SppConst::C) - clk_s;
+
+        // 计算卫星位置与钟差：位置计算包含地球自转改正（使用传播时间近似值 P/c）。
         SatState st;
         if (o.system == GnssSystem::GPS) {
             GpsEph gps_eph = ToGpsEph(eph);
