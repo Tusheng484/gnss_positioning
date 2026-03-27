@@ -6,6 +6,7 @@
  */
 
 #include "gnss_positioning/SPP.h"
+#include "gnss_positioning/SatPosCalc.h"
 #include<set>
 #include <map>
 #include <cmath>
@@ -22,6 +23,60 @@ namespace gnss {
 
 // 角度转弧度。
 static double deg2rad(double deg) { return deg * M_PI / 180.0; }
+
+static GpsEph ToGpsEph(const Ephemeris& eph) {
+    GpsEph out;
+    out.prn = eph.prn;
+    out.toc = eph.toc;
+    out.toe = eph.toe;
+    out.af0 = eph.af0;
+    out.af1 = eph.af1;
+    out.af2 = eph.af2;
+    out.tgd = eph.tgd;
+    out.sqrtA = eph.rootA;
+    out.e = eph.ecc;
+    out.i0 = eph.inc0;
+    out.iDot = eph.inc_dot;
+    out.Omega0 = eph.omega0;
+    out.OmegaDot = eph.omega_dot;
+    out.omega = eph.argper;
+    out.M0 = eph.m0;
+    out.deltaN = eph.dN;
+    out.cuc = eph.cuc;
+    out.cus = eph.cus;
+    out.crc = eph.crc;
+    out.crs = eph.crs;
+    out.cic = eph.cic;
+    out.cis = eph.cis;
+    return out;
+}
+
+static BdsEph ToBdsEph(const Ephemeris& eph) {
+    BdsEph out;
+    out.prn = eph.prn;
+    out.toc = eph.toc;
+    out.toe = eph.toe;
+    out.af0 = eph.af0;
+    out.af1 = eph.af1;
+    out.af2 = eph.af2;
+    out.tgd = eph.tgd;
+    out.sqrtA = eph.rootA;
+    out.e = eph.ecc;
+    out.i0 = eph.inc0;
+    out.iDot = eph.inc_dot;
+    out.Omega0 = eph.omega0;
+    out.OmegaDot = eph.omega_dot;
+    out.omega = eph.argper;
+    out.M0 = eph.m0;
+    out.deltaN = eph.dN;
+    out.cuc = eph.cuc;
+    out.cus = eph.cus;
+    out.crc = eph.crc;
+    out.crs = eph.crs;
+    out.cic = eph.cic;
+    out.cis = eph.cis;
+    return out;
+}
 
 Ephemeris ConvertFromGpsEphem(const GpsEphem& gps_eph) {
     // 工程约束：解码器输出结构体作为“输入数据模型”在应用层缓存；字段映射在此集中处理，避免应用层掺入定位领域细节。
@@ -223,106 +278,6 @@ double SPP::computeTransmitTime(double t_rx_gpst, double pseudorange_m) const {
     return t_rx_gpst - pseudorange_m / SppConst::C;
 }
 
-bool SPP::computeSatelliteClock(const Ephemeris& eph_gpst, double t_tx_gpst, double& clk_s) const {
-    // 五步法-第3步（部分）：广播星历卫星钟差计算（独立函数）
-    // dt = t_tx - toc
-    // clk = af0 + af1*dt + af2*dt^2 + relativity - TGD
-    // relativity = F * e * sqrtA * sin(Ek)
-    double dt = normalizeTimeSec(t_tx_gpst - eph_gpst.toc);
-    if (std::abs(dt) > SppConst::HALF_WEEK) return false;
-
-    double tk = normalizeTimeSec(t_tx_gpst - eph_gpst.toe);
-    if (std::abs(tk) > SppConst::HALF_WEEK) return false;
-
-    double mu = (eph_gpst.system == GnssSystem::GPS) ? SppConst::MU_GPS : SppConst::MU_BDS;
-    double n0 = std::sqrt(mu) / std::pow(eph_gpst.rootA, 3);
-    double n = n0 + eph_gpst.dN;
-    double Mk = eph_gpst.m0 + n * tk;
-
-    double Ek = Mk;
-    for (int i = 0; i < 10; ++i) {
-        double f = Ek - eph_gpst.ecc * std::sin(Ek) - Mk;
-        double fp = 1.0 - eph_gpst.ecc * std::cos(Ek);
-        double dE = -f / fp;
-        Ek += dE;
-        if (std::abs(dE) < 1e-12) break;
-    }
-
-    double relativity = SppConst::F_REL * eph_gpst.ecc * eph_gpst.rootA * std::sin(Ek);
-    clk_s = eph_gpst.af0 + eph_gpst.af1 * dt + eph_gpst.af2 * dt * dt + relativity - eph_gpst.tgd;
-
-    if (!std::isfinite(clk_s)) return false;
-    return true;
-}
-
-bool SPP::computeSatellitePosition(const Ephemeris& eph_gpst, double t_tx_gpst, XYZ& sat_pos_ecef, double& Ek_out) const {
-    // 五步法-第3步（部分）：广播星历卫星位置计算（严格按教材顺序）
-    // 1) tk = t_tx - toe（含周跳修正）
-    // 2) Mk = M0 + (n0+Δn)*tk
-    // 3) 解开普勒方程 Ek
-    // 4) vk、uk
-    // 5) du/dr/di
-    // 6) r、i
-    // 7) Ωk
-    // 8) 轨道平面 -> ECEF
-    double tk = normalizeTimeSec(t_tx_gpst - eph_gpst.toe);
-    if (std::abs(tk) > SppConst::HALF_WEEK) return false;
-
-    double mu = (eph_gpst.system == GnssSystem::GPS) ? SppConst::MU_GPS : SppConst::MU_BDS;
-    double n0 = std::sqrt(mu) / std::pow(eph_gpst.rootA, 3);
-    double n = n0 + eph_gpst.dN;
-    double Mk = eph_gpst.m0 + n * tk;
-
-    double Ek = Mk;
-    for (int i = 0; i < 10; ++i) {
-        double f = Ek - eph_gpst.ecc * std::sin(Ek) - Mk;
-        double fp = 1.0 - eph_gpst.ecc * std::cos(Ek);
-        double dE = -f / fp;
-        Ek += dE;
-        if (std::abs(dE) < 1e-12) break;
-    }
-    Ek_out = Ek;
-
-    double sinE = std::sin(Ek);
-    double cosE = std::cos(Ek);
-
-    double vk = std::atan2(std::sqrt(1.0 - eph_gpst.ecc * eph_gpst.ecc) * sinE, cosE - eph_gpst.ecc);
-    double uk = vk + eph_gpst.argper;
-
-    double sin2u = std::sin(2.0 * uk);
-    double cos2u = std::cos(2.0 * uk);
-    double du = eph_gpst.cus * sin2u + eph_gpst.cuc * cos2u;
-    double dr = eph_gpst.crs * sin2u + eph_gpst.crc * cos2u;
-    double di = eph_gpst.cis * sin2u + eph_gpst.cic * cos2u;
-
-    double a = eph_gpst.rootA * eph_gpst.rootA;
-    double r = a * (1.0 - eph_gpst.ecc * cosE) + dr;
-    double i = eph_gpst.inc0 + eph_gpst.inc_dot * tk + di;
-    uk += du;
-
-    double x_orb = r * std::cos(uk);
-    double y_orb = r * std::sin(uk);
-
-    double Omega = eph_gpst.omega0 + (eph_gpst.omega_dot - SppConst::OMEGA_E) * tk - SppConst::OMEGA_E * eph_gpst.toe;
-
-    sat_pos_ecef.x = x_orb * std::cos(Omega) - y_orb * std::cos(i) * std::sin(Omega);
-    sat_pos_ecef.y = x_orb * std::sin(Omega) + y_orb * std::cos(i) * std::cos(Omega);
-    sat_pos_ecef.z = y_orb * std::sin(i);
-
-    if (!std::isfinite(sat_pos_ecef.x) || !std::isfinite(sat_pos_ecef.y) || !std::isfinite(sat_pos_ecef.z)) return false;
-    return true;
-}
-
-void SPP::applyEarthRotationCorrection(XYZ& sat_pos_ecef, double transit_time_s) const {
-    // Sagnac 效应（地球自转改正）：
-    // 在信号传播时间内，地球自转导致惯性系与地固系存在相对旋转；该项以绕 Z 轴旋转近似补偿到 ECEF 坐标中。
-    double angle = SppConst::OMEGA_E * transit_time_s;
-    double x_new = sat_pos_ecef.x * std::cos(angle) + sat_pos_ecef.y * std::sin(angle);
-    double y_new = -sat_pos_ecef.x * std::sin(angle) + sat_pos_ecef.y * std::cos(angle);
-    sat_pos_ecef.x = x_new;
-    sat_pos_ecef.y = y_new;
-}
-
 double SPP::computeTroposphereSaastamoinen(const BLH& rx_blh, double elev_rad) const {
     // 五步法-第4步：对流层改正 T（Saastamoinen 简化模型）
     // 近似假设：采用标准大气参数并固定相对湿度；映射函数用 1/sin(elev) 的下限形式以增强低高度角数值稳定性。
@@ -385,19 +340,33 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
 
         double t_tx = computeTransmitTime(t_rx_gpst, o.P);
 
-        double clk_s = 0.0;
-        if (!computeSatelliteClock(eph, t_tx, clk_s)) continue;
+        SatState st0;
+        if (o.system == GnssSystem::GPS) {
+            GpsEph gps_eph = ToGpsEph(eph);
+            if (!ComputeGpsSatState(gps_eph, t_tx, 0.0, st0)) continue;
+        } else {
+            BdsEph bds_eph = ToBdsEph(eph);
+            if (!ComputeBdsSatState(bds_eph, t_tx, 0.0, st0)) continue;
+        }
+        double clk_s = st0.clk_s;
         // 发射时刻二次修正：
         // 将卫星钟差显式引入发射时刻估计，可降低钟差与轨道计算的耦合误差。
         // t_tx = t_rx - P/c - dt_s
         t_tx = t_rx_gpst - (o.P / SppConst::C) - clk_s;
-        if (!computeSatelliteClock(eph, t_tx, clk_s)) continue;
+        SatState st;
+        if (o.system == GnssSystem::GPS) {
+            GpsEph gps_eph = ToGpsEph(eph);
+            if (!ComputeGpsSatState(gps_eph, t_tx, o.P / SppConst::C, st)) continue;
+        } else {
+            BdsEph bds_eph = ToBdsEph(eph);
+            if (!ComputeBdsSatState(bds_eph, t_tx, o.P / SppConst::C, st)) continue;
+        }
+        clk_s = st.clk_s;
 
         XYZ sat_pos;
-        double Ek_dummy = 0.0;
-        if (!computeSatellitePosition(eph, t_tx, sat_pos, Ek_dummy)) continue;
-
-        applyEarthRotationCorrection(sat_pos, o.P / SppConst::C);
+        sat_pos.x = st.pos_ecef.x;
+        sat_pos.y = st.pos_ecef.y;
+        sat_pos.z = st.pos_ecef.z;
 
         double dx = sat_pos.x - rx_pos.x;
         double dy = sat_pos.y - rx_pos.y;

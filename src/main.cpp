@@ -19,6 +19,7 @@
 #include <gnss_positioning/NavMath.h>
 #include <gnss_positioning/NovatelDecoder.h>
 #include <gnss_positioning/SPP.h>
+#include <gnss_positioning/SatPosCalc.h>
 
 /**
  * @brief 程序入口：驱动数据解码与单点定位解算，并将历元结果输出到文件

@@ -245,30 +245,6 @@ private:
      */
     double computeTransmitTime(double t_rx_gpst, double pseudorange_m) const;
     /**
-     * @brief 计算卫星钟差（广播星历模型）
-     * @param eph_gpst 时间系统已统一为 GPST 的星历
-     * @param t_tx_gpst 发射时刻（GPST 周内秒）
-     * @param clk_s 输出的卫星钟差，单位：秒 (s)
-     * @return true: 计算成功；false: 输入不在有效时间范围或数值异常
-     */
-    bool computeSatelliteClock(const Ephemeris& eph_gpst, double t_tx_gpst, double& clk_s) const;
-    /**
-     * @brief 计算卫星 ECEF 位置（广播星历模型）
-     * @param eph_gpst 时间系统已统一为 GPST 的星历
-     * @param t_tx_gpst 发射时刻（GPST 周内秒）
-     * @param sat_pos_ecef 输出的卫星 ECEF 坐标，单位：米 (m)
-     * @param Ek_out 输出的偏近点角 Ek（用于相对论改正或诊断）
-     * @return true: 计算成功；false: 输入不在有效时间范围或数值异常
-     */
-    bool computeSatellitePosition(const Ephemeris& eph_gpst, double t_tx_gpst, XYZ& sat_pos_ecef, double& Ek_out) const;
-    /**
-     * @brief 地球自转改正（Sagnac 效应）对卫星坐标的影响
-     * @param sat_pos_ecef 输入/输出的卫星 ECEF 坐标（会被原地修正）
-     * @param transit_time_s 信号传播时间，单位：秒 (s)
-     * @return 无
-     */
-    void applyEarthRotationCorrection(XYZ& sat_pos_ecef, double transit_time_s) const;
-    /**
      * @brief 构建最小二乘解算所需的观测方程中间量
      * @param t_rx_gpst 接收时刻（GPST 周内秒）
      * @param procObs 预处理后的观测列表
