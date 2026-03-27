@@ -24,8 +24,15 @@ namespace gnss {
 // 角度转弧度。
 static double deg2rad(double deg) { return deg * M_PI / 180.0; }
 
+static double gpstToBdtSec(double t_gpst) {
+    double out = t_gpst - SppConst::BDT_GPS_OFFSET;
+    while (out >= SppConst::WEEK_SEC) out -= SppConst::WEEK_SEC;
+    while (out < 0.0) out += SppConst::WEEK_SEC;
+    return out;
+}
+
 // 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
-// 该映射仅做字段搬运，不引入任何单位换算，以保持重构前后计算口径一致。
+// 该映射仅做字段搬运，不引入任何单位换算，以保持前后计算口径一致。
 static GpsEph ToGpsEph(const Ephemeris& eph) {
     GpsEph out;
     out.prn = eph.prn;
@@ -54,7 +61,7 @@ static GpsEph ToGpsEph(const Ephemeris& eph) {
 }
 
 // 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
-// BDS 的 toe/toc 时间系统转换由 SPP 内部 normalizeEphemerisToGpSt() 负责完成。
+// BDS 的 toe/toc 时间系统转换在 SatPosCalc 的 BDS 入口中完成；SPP 侧保持 toe/toc 为 BDT 周内秒口径。
 static BdsEph ToBdsEph(const Ephemeris& eph) {
     BdsEph out;
     out.prn = eph.prn;
@@ -174,18 +181,14 @@ uint32_t SPP::makeKey(GnssSystem sys, uint32_t prn) {
 
 Ephemeris SPP::normalizeEphemerisToGpSt(const Ephemeris& eph) const {
     Ephemeris out = eph;
-    if (out.system == GnssSystem::BDS) {
-        // 时间系统统一（核心约束）：
-        // - 解算内部统一采用 GPST 作为时间基准
-        // - 若 toe/toc 为 BDT，则转换到 GPST：t_gps = t_bds + 14s
-        // - 不在发射时刻求解阶段引入系统时间偏移；系统差异通过观测方程中的 ISB 建模
-        out.toe += SppConst::BDT_GPS_OFFSET;
-        out.toc += SppConst::BDT_GPS_OFFSET;
-        while (out.toe >= SppConst::WEEK_SEC) out.toe -= SppConst::WEEK_SEC;
-        while (out.toe < 0.0) out.toe += SppConst::WEEK_SEC;
-        while (out.toc >= SppConst::WEEK_SEC) out.toc -= SppConst::WEEK_SEC;
-        while (out.toc < 0.0) out.toc += SppConst::WEEK_SEC;
-    }
+    // 时间系统处理策略：
+    // - 本模块内部时标为 GPST，但 BDS 星历原始 toe/toc 通常为 BDT
+    // - 为实现单向依赖，时间系统统一在卫星状态计算模块（SatPosCalc）入口中完成
+    // - 此处仅做周内秒归一化，避免缓存中的 toe/toc 溢出周界
+    while (out.toe >= SppConst::WEEK_SEC) out.toe -= SppConst::WEEK_SEC;
+    while (out.toe < 0.0) out.toe += SppConst::WEEK_SEC;
+    while (out.toc >= SppConst::WEEK_SEC) out.toc -= SppConst::WEEK_SEC;
+    while (out.toc < 0.0) out.toc += SppConst::WEEK_SEC;
     return out;
 }
 
@@ -353,7 +356,7 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
             if (!ComputeGpsSatState(gps_eph, t_tx, 0.0, st0)) continue;
         } else {
             BdsEph bds_eph = ToBdsEph(eph);
-            if (!ComputeBdsSatState(bds_eph, t_tx, 0.0, st0)) continue;
+            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx), 0.0, st0)) continue;
         }
         double clk_s = st0.clk_s;
         // 发射时刻二次修正：
@@ -361,14 +364,14 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         // t_tx = t_rx - P/c - dt_s
         t_tx = t_rx_gpst - (o.P / SppConst::C) - clk_s;
 
-        // 计算卫星位置与钟差：位置计算包含地球自转改正（使用传播时间近似值 P/c）。
+        // 计算卫星位置与钟差：卫星状态模块不在此阶段施加 Sagnac 坐标旋转，Sagnac 改正在测距方程层面单独处理。
         SatState st;
         if (o.system == GnssSystem::GPS) {
             GpsEph gps_eph = ToGpsEph(eph);
-            if (!ComputeGpsSatState(gps_eph, t_tx, o.P / SppConst::C, st)) continue;
+            if (!ComputeGpsSatState(gps_eph, t_tx, 0.0, st)) continue;
         } else {
             BdsEph bds_eph = ToBdsEph(eph);
-            if (!ComputeBdsSatState(bds_eph, t_tx, o.P / SppConst::C, st)) continue;
+            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx), 0.0, st)) continue;
         }
         clk_s = st.clk_s;
 
@@ -380,13 +383,19 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         double dx = sat_pos.x - rx_pos.x;
         double dy = sat_pos.y - rx_pos.y;
         double dz = sat_pos.z - rx_pos.z;
-        double rho = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (!(rho > 1.0)) continue;
+        double rho0 = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!(rho0 > 1.0)) continue;
 
         XYZ los;
-        los.x = dx / rho;
-        los.y = dy / rho;
-        los.z = dz / rho;
+        los.x = dx / rho0;
+        los.y = dy / rho0;
+        los.z = dz / rho0;
+
+        // Sagnac 改正（测距方程层面）：
+        // 采用常用的一阶近似项：Δρ = ωe/c * (Xs*Yr - Ys*Xr)。
+        // 该项属于 SPP 级建模；更高精度的建模可在传播路径层面统一处理。
+        double sagnac_m = (SppConst::OMEGA_E / SppConst::C) * (sat_pos.x * rx_pos.y - sat_pos.y * rx_pos.x);
+        double rho = rho0 + sagnac_m;
 
         double E, N, U;
         if (XyzToEnu(rx_pos, sat_pos, E, N, U) != 0) continue;

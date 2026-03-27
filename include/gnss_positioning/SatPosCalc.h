@@ -111,7 +111,7 @@ struct SatState {
  * @brief 计算 GPS 卫星位置、速度与钟差/钟速
  * @param eph GPS 广播星历（WGS84）
  * @param t_gpst 计算历元（周内秒），单位：秒 (s)
- * @param transit_time_s 信号传播时间（用于地球自转改正），单位：秒 (s)
+ * @param transit_time_s 信号传播时间（预留参数，Sagnac 改正建议在测距方程层面处理），单位：秒 (s)
  * @param state 输出卫星状态
  * @return true: 计算完成且数值有效；false: 计算失败或数值异常
  */
@@ -120,8 +120,8 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
 /**
  * @brief 计算 BDS 卫星位置、速度与钟差/钟速
  * @param eph BDS 广播星历（CGCS2000）
- * @param t_bdt 计算历元（周内秒），单位：秒 (s)
- * @param transit_time_s 信号传播时间（用于地球自转改正），单位：秒 (s)
+ * @param t_bdt 计算历元（周内秒，BDT），单位：秒 (s)
+ * @param transit_time_s 信号传播时间（预留参数，Sagnac 改正建议在测距方程层面处理），单位：秒 (s)
  * @param state 输出卫星状态
  * @return true: 计算完成且数值有效；false: 计算失败或数值异常
  */
