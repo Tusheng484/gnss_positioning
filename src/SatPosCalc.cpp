@@ -26,7 +26,7 @@ constexpr double kOmegaEGps = 7.2921151467e-5;
 
 // BDS（CGCS2000）轨道动力学常量。
 constexpr double kMuBds = 3.986004418e14;
-constexpr double kOmegaEBds = 7.2921150e-5;
+constexpr double kOmegaEBds = 7.2921151467e-5;
 
 // 相对论改正：Δtr = F * e * sqrt(A) * sin(E)。
 constexpr double kRelF = -4.442807633e-10;
@@ -318,53 +318,40 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
 
 bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, SatState& state) {
     state = SatState{};
-
     (void)transit_time_s;
 
-    // BDS 时间系统统一：入口参数按 BDT 解释，在此转换为 GPST 参与后续所有计算。
-    double t_gpst = ConvertBdtToGpStSec(t_bdt);
-    double toe_gpst = ConvertBdtToGpStSec(eph.toe);
-    double toc_gpst = ConvertBdtToGpStSec(eph.toc);
-
-    double tk = NormalizeWeekCrossover(t_gpst - toe_gpst);
+    // 直接使用原生的 BDT 时间计算，切勿加 14 秒！
+    double tk = NormalizeWeekCrossover(t_bdt - eph.toe);
     state.eph_expired = (std::abs(tk) > kBdsEphValidSec);
 
-    if (!ComputeClock(t_gpst, toc_gpst, toe_gpst, kMuBds, eph.af0, eph.af1, eph.af2, eph.tgd, eph.sqrtA, eph.e, eph.deltaN,
+    if (!ComputeClock(t_bdt, eph.toc, eph.toe, kMuBds, eph.af0, eph.af1, eph.af2, eph.tgd, eph.sqrtA, eph.e, eph.deltaN,
                       eph.M0, state.clk_s, state.clk_drift)) {
         return false;
     }
 
     OrbitalPlane orb;
     double tk_orb = 0.0;
-    if (!ComputeOrbitalPlaneAnalytical(kMuBds, t_gpst, toe_gpst, eph.sqrtA, eph.e, eph.i0, eph.iDot, eph.omega, eph.M0,
+    if (!ComputeOrbitalPlaneAnalytical(kMuBds, t_bdt, eph.toe, eph.sqrtA, eph.e, eph.i0, eph.iDot, eph.omega, eph.M0,
                                        eph.deltaN, eph.cuc, eph.cus, eph.crc, eph.crs, eph.cic, eph.cis, orb, tk_orb)) {
         return false;
     }
 
     bool is_geo = IsBdsGeoPrn(eph.prn);
     if (!is_geo) {
-        // BDS MEO/IGSO：与 GPS 类似的地固系建模，但 μ、ωe 使用 BDS 常量。
-        double Omega = eph.Omega0 + (eph.OmegaDot - kOmegaEBds) * tk_orb - kOmegaEBds * toe_gpst;
+        // 使用原生的 eph.toe
+        double Omega = eph.Omega0 + (eph.OmegaDot - kOmegaEBds) * tk_orb - kOmegaEBds * eph.toe;
         double Omega_dot = eph.OmegaDot - kOmegaEBds;
         ComputeEcefFromOrbitalPlane(orb, Omega, Omega_dot, state.pos_ecef, state.vel_ecef);
     } else {
-        // BDS GEO：采用 GEO 专用建模。注意：不能使用与 MEO/IGSO 相同的 Ω 公式。
-        // 1) 先在 GEO 自身参考系下构建（不包含 -ωe*toe 项）
-        // 2) 施加 Rx(-5°) 倾斜
-        // 3) 再以 Rz(ωe*tk) 旋转至地固系（BDCS/ECEF）
-        Vec3 pos_geo;
-        Vec3 vel_geo;
-
-        // GEO 分支使用 Ω = Ω0 + Ωdot*tk - ωe*toe，地球自转项不并入 Ωdot。
-        double Omega = eph.Omega0 + eph.OmegaDot * tk_orb - kOmegaEBds * toe_gpst;
+        Vec3 pos_geo, vel_geo;
+        // 使用原生的 eph.toe
+        double Omega = eph.Omega0 + eph.OmegaDot * tk_orb - kOmegaEBds * eph.toe;
         double Omega_dot = eph.OmegaDot;
         ComputeEcefFromOrbitalPlane(orb, Omega, Omega_dot, pos_geo, vel_geo);
 
         Vec3 pos_tilt = Rx(kBdsGeoTiltRad, pos_geo);
         Vec3 vel_tilt = Rx(kBdsGeoTiltRad, vel_geo);
 
-        // GEO 专用旋转矩阵：Rz(ωe*tk) Rx(-5°)。
-        // 注意：BDS ICD 常用写法的 Rz(ωe*tk) 对应坐标旋转矩阵 [cos sin; -sin cos]，等价于本实现中的 Rz(-θ)。
         double theta = kOmegaEBds * tk_orb;
         state.pos_ecef = Rz(-theta, pos_tilt);
         state.vel_ecef = Rz(-theta, vel_tilt);
@@ -373,7 +360,6 @@ bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, 
         state.vel_ecef.x += rot_term.x;
         state.vel_ecef.y += rot_term.y;
         state.vel_ecef.z += rot_term.z;
-
     }
 
     state.valid = IsFinite(state.pos_ecef.x) && IsFinite(state.pos_ecef.y) && IsFinite(state.pos_ecef.z) &&

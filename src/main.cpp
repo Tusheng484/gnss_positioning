@@ -38,22 +38,6 @@ int main() {
         return static_cast<uint32_t>(sys) * 1000U + prn;
     };
 
-    auto normalizeBdsTimeToGpSt = [](double t) -> double {
-        double out = t + gnss::SppConst::BDT_GPS_OFFSET;
-        while (out >= gnss::SppConst::WEEK_SEC) out -= gnss::SppConst::WEEK_SEC;
-        while (out < 0.0) out += gnss::SppConst::WEEK_SEC;
-        return out;
-    };
-
-    auto normalizeEphemerisToGpSt = [&](const gnss::Ephemeris& eph) -> gnss::Ephemeris {
-        gnss::Ephemeris out = eph;
-        if (out.system == gnss::GnssSystem::BDS) {
-            out.toe = normalizeBdsTimeToGpSt(out.toe);
-            out.toc = normalizeBdsTimeToGpSt(out.toc);
-        }
-        return out;
-    };
-
     auto toGpsEph = [](const gnss::Ephemeris& eph) -> gnss::GpsEph {
         gnss::GpsEph out;
         out.prn = eph.prn;
@@ -108,6 +92,13 @@ int main() {
         return out;
     };
 
+    auto gpstToBdtSec = [](double t_gpst) -> double {
+        double out = t_gpst - gnss::SppConst::BDT_GPS_OFFSET;
+        while (out >= gnss::SppConst::WEEK_SEC) out -= gnss::SppConst::WEEK_SEC;
+        while (out < 0.0) out += gnss::SppConst::WEEK_SEC;
+        return out;
+    };
+
     std::string inputPath = "D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log";
     std::ifstream inFile(inputPath, std::ios::binary);
     if (!inFile.is_open()) {
@@ -133,9 +124,10 @@ int main() {
         std::cerr << "[ERROR] 无法创建输出文件: " << satOutPath << std::endl;
         return 1;
     }
-    satFile << "TOW_RX(s)\tSYS\tPRN\tFREQIDX\tSNR(dBHz)\tP(m)\tT_TX(s)\tDT_PROP(s)\t"
-               "X(m)\tY(m)\tZ(m)\tVX(m/s)\tVY(m/s)\tVZ(m/s)\tCLK(s)\tCLK_DOT(s/s)\tEPH_EXPIRED\tVALID"
-            << std::endl;
+    satFile << "* 通用时 (计算时刻)" << std::endl;
+    satFile << "* GPS周，周内秒 (计算时刻)" << std::endl;
+    satFile << "卫星号 POS_X(km) POS_Y(km) POS_Z(km) VEL_X(m/s) VEL_Y(m/s) VEL_Z(m/s) CLK(us) CLK_VEL(us/sec)" << std::endl;
+    satFile << "注意：卫星号前“B”表示广播星历，卫星位置、钟差等均未经任何改正" << std::endl;
 
     uint32_t totalBytes = 0;
     uint32_t rangeFrameCount = 0;
@@ -172,16 +164,33 @@ int main() {
                 const auto& bds_eph = decoder.getBdsEphem();
                 if (bds_eph.prn >= 1 && bds_eph.prn <= 63) {
                     gnss::Ephemeris eph = gnss::ConvertFromBdsEphem(bds_eph);
-                    ephStore[makeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = normalizeEphemerisToGpSt(eph);
+                    ephStore[makeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = eph;
                     bdsEphCount++;
                 }
             } else if (msgId == 43) { // RANGE
                 rangeFrameCount++;
                 double tow = decoder.getTow();
                 const auto& obsList = decoder.getObsData();
+                gnss::GPSTIME gpsTime;
+                gpsTime.Week = decoder.getWeek();
+                gpsTime.SecOfWeek = tow;
+                gnss::COMMONTIME ct;
+                gnss::GpsTimeToCommonTime(gpsTime, ct);
 
+                satFile << std::endl;
+                satFile << "* " << ct.Year << " " << ct.Month << " " << ct.Day << " " << ct.Hour << " " << ct.Minute << " "
+                        << std::fixed << std::setprecision(8) << ct.Second << std::endl;
+                satFile << "* " << gpsTime.Week << " " << std::fixed << std::setprecision(8) << gpsTime.SecOfWeek << std::endl;
+
+                std::map<uint32_t, gnss::ObsData> uniqObs;
                 for (const auto& obs : obsList) {
-                    if (!(obs.pseudorange > 0.0)) continue;
+                    if (obs.system != gnss::GnssSystem::GPS && obs.system != gnss::GnssSystem::BDS) continue;
+                    if (obs.freqIdx != 0) continue;
+                    uniqObs[makeKey(obs.system, obs.prn)] = obs;
+                }
+
+                for (const auto& kv : uniqObs) {
+                    const auto& obs = kv.second;
                     satCalcTotal++;
 
                     auto it = ephStore.find(makeKey(obs.system, obs.prn));
@@ -191,57 +200,31 @@ int main() {
                     }
                     const gnss::Ephemeris& eph = it->second;
 
-                    double dt_prop = obs.pseudorange / gnss::SppConst::C;
-                    double t_tx = tow - dt_prop;
-
-                    gnss::SatState st0;
-                    bool ok0 = false;
-                    if (obs.system == gnss::GnssSystem::GPS) {
-                        gnss::GpsEph e = toGpsEph(eph);
-                        ok0 = gnss::ComputeGpsSatState(e, t_tx, 0.0, st0);
-                    } else if (obs.system == gnss::GnssSystem::BDS) {
-                        gnss::BdsEph e = toBdsEph(eph);
-                        ok0 = gnss::ComputeBdsSatState(e, t_tx, 0.0, st0);
-                    }
-                    if (!ok0) continue;
-
-                    t_tx = tow - dt_prop - st0.clk_s;
-
                     gnss::SatState st;
                     bool ok = false;
                     if (obs.system == gnss::GnssSystem::GPS) {
                         gnss::GpsEph e = toGpsEph(eph);
-                        ok = gnss::ComputeGpsSatState(e, t_tx, dt_prop, st);
-                    } else if (obs.system == gnss::GnssSystem::BDS) {
+                        ok = gnss::ComputeGpsSatState(e, tow, 0.0, st);
+                    } else {
                         gnss::BdsEph e = toBdsEph(eph);
-                        ok = gnss::ComputeBdsSatState(e, t_tx, dt_prop, st);
+                        ok = gnss::ComputeBdsSatState(e, gpstToBdtSec(tow), 0.0, st);
                     }
                     if (!ok) continue;
 
                     satCalcOk++;
                     if (st.valid) satCalcValid++;
 
-                    char sysChar = 'U';
-                    if (obs.system == gnss::GnssSystem::GPS) sysChar = 'G';
-                    else if (obs.system == gnss::GnssSystem::BDS) sysChar = 'C';
-
-                    satFile << std::fixed << std::setprecision(3)
-                            << tow << "\t"
-                            << sysChar << "\t"
-                            << obs.prn << "\t"
-                            << obs.freqIdx << "\t"
-                            << static_cast<double>(obs.snr) << "\t"
-                            << obs.pseudorange << "\t"
-                            << t_tx << "\t"
-                            << dt_prop << "\t"
-                            << std::setprecision(3)
-                            << st.pos_ecef.x << "\t" << st.pos_ecef.y << "\t" << st.pos_ecef.z << "\t"
-                            << std::setprecision(6)
-                            << st.vel_ecef.x << "\t" << st.vel_ecef.y << "\t" << st.vel_ecef.z << "\t"
-                            << std::scientific << std::setprecision(16)
-                            << st.clk_s << "\t" << st.clk_drift << "\t"
-                            << std::fixed << std::setprecision(0)
-                            << (st.eph_expired ? 1 : 0) << "\t" << (st.valid ? 1 : 0)
+                    char sysChar = (obs.system == gnss::GnssSystem::GPS) ? 'G' : 'C';
+                    satFile << "B" << sysChar << std::setw(2) << std::setfill('0') << obs.prn << std::setfill(' ') << "  "
+                            << std::fixed << std::setprecision(6)
+                            << std::setw(12) << (st.pos_ecef.x / 1000.0) << " "
+                            << std::setw(12) << (st.pos_ecef.y / 1000.0) << " "
+                            << std::setw(12) << (st.pos_ecef.z / 1000.0) << " "
+                            << std::setw(9) << std::setprecision(3) << st.vel_ecef.x << " "
+                            << std::setw(9) << std::setprecision(3) << st.vel_ecef.y << " "
+                            << std::setw(9) << std::setprecision(3) << st.vel_ecef.z << " "
+                            << std::setw(13) << std::setprecision(6) << (st.clk_s * 1e6) << " "
+                            << std::setw(13) << std::setprecision(6) << (st.clk_drift * 1e6)
                             << std::endl;
                 }
                 

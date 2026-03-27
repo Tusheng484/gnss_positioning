@@ -498,8 +498,9 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     double isb_bds_m = sol_.isb_bds_m;
 
     for (int iter = 0; iter < max_iter_; ++iter) {
+        double t_rx_true = t_rx_gpst - (clk_gps_m / SppConst::C);
         std::vector<SatCalc> sats;
-        if (!buildObservationEquation(t_rx_gpst, procObs, ephList, rx_pos, clk_gps_m, isb_bds_m, sats)) {
+        if (!buildObservationEquation(t_rx_true, procObs, ephList, rx_pos, clk_gps_m, isb_bds_m, sats)) {
             return false;
         }
 
