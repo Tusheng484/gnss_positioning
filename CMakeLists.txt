@@ -12,6 +12,7 @@ add_library(gnss_positioning_lib
     src/NovatelDecoder.cpp
     src/SPP.cpp
     src/SatPosCalc.cpp
+    src/ErrorCorrection.cpp
 )
 # public include paths for library; also expose third_party/eigen for users
 target_include_directories(gnss_positioning_lib

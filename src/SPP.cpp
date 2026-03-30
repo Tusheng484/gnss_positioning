@@ -7,6 +7,7 @@
 
 #include "gnss_positioning/SPP.h"
 #include "gnss_positioning/SatPosCalc.h"
+#include "gnss_positioning/ErrorCorrection.h"
 #include<set>
 #include <map>
 #include <cmath>
@@ -249,24 +250,20 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
         po.P = fo.P0;
 
         if (enable_iono_free_ && fo.has1) {
-            // 无电离层组合伪距（Iono-Free，一阶电离层项抵消）：
-            // P_IF = (f1^2 * P(f1) - f2^2 * P(f2)) / (f1^2 - f2^2)
             double f1 = 0.0;
             double f2 = 0.0;
             if (fo.sys == GnssSystem::GPS) {
-                f1 = SppConst::GPS_L1;
-                f2 = SppConst::GPS_L2;
+                f1 = ErrorConst::GPS_L1;
+                f2 = ErrorConst::GPS_L2;
             } else if (fo.sys == GnssSystem::BDS) {
-                f1 = SppConst::BDS_B1I;
-                f2 = SppConst::BDS_B3I;
+                f1 = ErrorConst::BDS_B1I;
+                f2 = ErrorConst::BDS_B3I;
             }
 
             if (f1 > 0.0 && f2 > 0.0) {
-                double f1_2 = f1 * f1;
-                double f2_2 = f2 * f2;
-                double denom = (f1_2 - f2_2);
+                double denom = (f1 * f1 - f2 * f2);
                 if (std::abs(denom) > 1e-6) {
-                    po.P = (f1_2 * fo.P0 - f2_2 * fo.P1) / denom;
+                    po.P = IonFreeCombo(fo.P0, fo.P1, f1, f2);
                     po.iono_free = true;
                 }
             }
@@ -286,26 +283,7 @@ double SPP::computeTransmitTime(double t_rx_gpst, double pseudorange_m) const {
 }
 
 double SPP::computeTroposphereSaastamoinen(const BLH& rx_blh, double elev_rad) const {
-    // 五步法-第4步：对流层改正 T（Saastamoinen 简化模型）
-    // 近似假设：采用标准大气参数并固定相对湿度；映射函数用 1/sin(elev) 的下限形式以增强低高度角数值稳定性。
-    if (!(elev_rad > 0.0)) return 0.0;
-    double h = rx_blh.height;
-    if (!std::isfinite(h)) h = 0.0;
-    if (h < -100.0) h = -100.0;
-    if (h > 10000.0) h = 10000.0;
-
-    double P0 = 1013.25;
-    double T0 = 293.15;
-    double P = P0 * std::pow(1.0 - 2.26e-5 * h, 5.225);
-    double T = T0 - 6.5e-3 * h;
-    double RH = 0.5;
-    double Tc = T - 273.15;
-    double e = RH * 6.11 * std::exp((17.15 * Tc) / (234.7 + Tc));
-
-    double sinE = std::sin(std::max(elev_rad, deg2rad(5.0)));
-    double zhd = 0.0022768 * P;
-    double zwd = 0.002277 * (1255.0 / T + 0.05) * e;
-    return (zhd + zwd) / sinE;
+    return HopfieldTropDelay(rx_blh.height, elev_rad);
 }
 
 bool SPP::buildObservationEquation(double t_rx_gpst,
