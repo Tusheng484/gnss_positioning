@@ -70,6 +70,15 @@ struct SppSolution {
     XYZ pos;                  ///< 接收机 ECEF 坐标 (m)
     double clk_gps_m;         ///< GPS 接收机钟差 (m)，即 c*dt_r
     double isb_bds_m;         ///< BDS 相对 GPS 的系统间偏差 (m)
+
+    XYZ vel = {0.0, 0.0, 0.0};///< 接收机 ECEF 速度 (m/s)
+    double clk_drift_ms = 0.0;///< 接收机钟差变化率 c*dt_dot_r (m/s)
+
+    double pdop = 999.0;      ///< 位置精度因子（PDOP）
+    double sigma0 = 0.0;      ///< 单位权中误差 (m)
+    int nsat_used = 0;        ///< 参与解算的卫星数
+    int nsat_gps = 0;         ///< 参与解算的 GPS 卫星数
+    int nsat_bds = 0;         ///< 参与解算的 BDS 卫星数
 };
 
 /**
@@ -89,6 +98,14 @@ struct SppEpochReport {
     XYZ pos = {0.0, 0.0, 0.0};///< 解算得到的接收机 ECEF 坐标 (m)
     double clk_gps_m = 0.0;   ///< 解算得到的 GPS 接收机钟差 (m)
     double isb_bds_m = 0.0;   ///< 解算得到的 BDS 相对 GPS 的系统间偏差 (m)
+
+    XYZ vel = {0.0, 0.0, 0.0}; ///< 测速结果（ECEF，m/s）
+    double clk_drift_ms = 0.0; ///< 接收机钟漂 c*dt_dot_r (m/s)
+    double pdop = 999.0;       ///< PDOP
+    double sigma0 = 0.0;       ///< 单位权中误差 (m)
+    int nsat_used = 0;         ///< 参与解算卫星数
+    int rejected = 0;          ///< 粗差剔除卫星数
+    bool vel_ok = false;       ///< 测速是否成功
 };
 
 /**
@@ -192,6 +209,10 @@ private:
         double P;             ///< 参与解算的伪距 (m)（可为无电离层组合）
         double snr;           ///< 观测信噪比（用于质量控制）
         bool iono_free;       ///< 是否为无电离层组合观测
+
+        double doppler = 0.0;    ///< 多普勒观测值 (Hz)，正值表示卫星接近
+        double wavelength = 0.0; ///< 对应载波波长 (m)
+        bool has_doppler = false;///< 是否存在有效多普勒观测
     };
 
     /**
@@ -208,6 +229,12 @@ private:
         double tropo_m;        ///< 对流层延迟 (m)
         double P_corr;         ///< 观测伪距 + c*dt_s (m)
         bool valid;           ///< 中间量是否有效
+
+        XYZ vel_ecef = {0.0, 0.0, 0.0}; ///< 卫星 ECEF 速度 (m/s)
+        double clk_drift_s = 0.0;       ///< 卫星钟速 (s/s)
+        double doppler_ms = 0.0;        ///< 多普勒换算的距离变化率 (m/s)
+        double az_rad = 0.0;            ///< 方位角 (rad)
+        bool has_doppler = false;       ///< 是否有有效多普勒观测
     };
 
     /**
@@ -245,6 +272,22 @@ private:
      */
     double computeTransmitTime(double t_rx_gpst, double pseudorange_m) const;
     /**
+     * @brief 迭代计算信号传播时间并输出卫星状态（含地球自转改正）
+     * @param t_rx_gpst 接收时刻（GPST 周内秒）
+     * @param pseudorange_m 伪距观测值，单位：米 (m)
+     * @param eph 广播星历（时间系统保持原始口径：GPS 为 GPST，BDS 为 BDT）
+     * @param rx_pos_approx 接收机坐标近似值（ECEF）
+     * @param proc 预处理观测（包含多普勒等信息）
+     * @param satCalc 输出的卫星中间量
+     * @return true: 计算成功；false: 数值异常或星历不可用
+     */
+    bool computeSatState(double t_rx_gpst,
+                         double pseudorange_m,
+                         const Ephemeris& eph,
+                         const XYZ& rx_pos_approx,
+                         const ProcObs& proc,
+                         SatCalc& satCalc) const;
+    /**
      * @brief 构建最小二乘解算所需的观测方程中间量
      * @param t_rx_gpst 接收时刻（GPST 周内秒）
      * @param procObs 预处理后的观测列表
@@ -263,18 +306,11 @@ private:
                                  double isb_bds_m,
                                  std::vector<SatCalc>& satCalcs) const;
     /**
-     * @brief Saastamoinen 对流层延迟模型（简化形式）
-     * @param rx_blh 接收机大地坐标（WGS84）
-     * @param elev_rad 卫星高度角，单位：弧度 (rad)
-     * @return 对流层延迟，单位：米 (m)
-     */
-    double computeTroposphereSaastamoinen(const BLH& rx_blh, double elev_rad) const;
-    /**
      * @brief 最小二乘法求解状态增量
      * @param sats 有效卫星中间量列表
      * @param dx 输出的状态增量向量
-     * @param v 输出的加权残差向量
-     * @param H 输出的加权设计矩阵
+     * @param v 输出的后验残差向量（未加权）
+     * @param H 输出的设计矩阵（未加权）
      * @return true: 求解成功；false: 求解失败或结果非有限数
      */
     bool solveLeastSquares(const std::vector<SatCalc>& sats,
@@ -282,8 +318,35 @@ private:
                            Eigen::VectorXd& v,
                            Eigen::MatrixXd& H) const;
 
+    /**
+     * @brief 基于多普勒观测进行单点测速
+     * @param sats 有效卫星中间量列表
+     * @param rx_pos 接收机坐标（ECEF）
+     * @param vel_dx 输出速度解向量 [Vx, Vy, Vz, c*dt_dot_r]^T
+     * @return true: 求解成功；false: 可用卫星不足或数值异常
+     */
+    bool solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eigen::VectorXd& vel_dx) const;
+
+    /**
+     * @brief 计算 PDOP 精度因子
+     * @param H 定位解算收敛后的设计矩阵（未加权）
+     * @return PDOP，异常时返回 999.0
+     */
+    double computePDOP(const Eigen::MatrixXd& H) const;
+
+    /**
+     * @brief 基于标准化残差的粗差探测与剔除
+     * @param sats 卫星中间量列表（会按 valid 标志剔除）
+     * @param v 后验残差向量（未加权，单位：米）
+     * @param sigma0 单位权中误差 (m)
+     * @return 被剔除的卫星数量
+     */
+    int detectOutliers(std::vector<SatCalc>& sats, const Eigen::VectorXd& v, double sigma0) const;
+
 private:
     SppSolution sol_;
+    int last_rejected_ = 0;
+    bool last_vel_ok_ = false;
     int max_iter_;
     double conv_m_;
     double elev_mask_deg_;
