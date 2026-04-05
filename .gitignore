@@ -15,3 +15,9 @@ output/
 *.txt
 *.log
 *.SP3
+
+#忽略绘图
+plot/
+*.png
+*.jpg
+*.jpeg

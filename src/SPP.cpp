@@ -32,8 +32,8 @@ static double normalizeTowSec(double tow) {
     return out;
 }
 
-static double bdtToGpstSec(double t_bdt) {
-    return normalizeTowSec(t_bdt + SppConst::BDT_GPS_OFFSET);
+static double gpstToBdtSec(double t_gpst) {
+    return normalizeTowSec(t_gpst - SppConst::BDT_GPS_OFFSET);
 }
 
 // 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
@@ -182,13 +182,8 @@ uint32_t SPP::makeKey(GnssSystem sys, uint32_t prn) {
 
 Ephemeris SPP::normalizeEphemerisToGpSt(const Ephemeris& eph) const {
     Ephemeris out = eph;
-    if (out.system == GnssSystem::BDS) {
-        out.toe = bdtToGpstSec(out.toe);
-        out.toc = bdtToGpstSec(out.toc);
-    } else {
-        out.toe = normalizeTowSec(out.toe);
-        out.toc = normalizeTowSec(out.toc);
-    }
+    out.toe = normalizeTowSec(out.toe);
+    out.toc = normalizeTowSec(out.toc);
     return out;
 }
 
@@ -318,9 +313,9 @@ bool SPP::computeSatState(double t_rx_gpst,
             if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx_corr), 0.0, st_corr)) return false;
         } else if (eph.system == GnssSystem::BDS) {
             const BdsEph bds_eph = ToBdsEph(eph);
-            if (!ComputeBdsSatState(bds_eph, normalizeTowSec(t_tx), 0.0, st)) return false;
+            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx), 0.0, st)) return false;
             t_tx_corr = t_tx - st.clk_s;
-            if (!ComputeBdsSatState(bds_eph, normalizeTowSec(t_tx_corr), 0.0, st_corr)) return false;
+            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx_corr), 0.0, st_corr)) return false;
         } else {
             return false;
         }
@@ -359,6 +354,7 @@ bool SPP::computeSatState(double t_rx_gpst,
     satCalc.vel_ecef.z = vz;
 
     satCalc.clk_s = st_corr.clk_s;
+    if (proc.iono_free) satCalc.clk_s += eph.tgd;
     satCalc.clk_drift_s = st_corr.clk_drift;
 
     satCalc.has_doppler = proc.has_doppler && (proc.wavelength > 0.0) && std::isfinite(proc.doppler);
@@ -667,10 +663,35 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
             const int required = dual ? 5 : 4;
             if (static_cast<int>(sats.size()) < required) return false;
 
+            if (verbose_) {
+                double elev_min = std::numeric_limits<double>::infinity();
+                double elev_max = -std::numeric_limits<double>::infinity();
+                double trop_min = std::numeric_limits<double>::infinity();
+                double trop_max = -std::numeric_limits<double>::infinity();
+                for (const auto& s : sats) {
+                    elev_min = std::min(elev_min, s.elev_rad);
+                    elev_max = std::max(elev_max, s.elev_rad);
+                    trop_min = std::min(trop_min, s.tropo_m);
+                    trop_max = std::max(trop_max, s.tropo_m);
+                }
+                std::cout << "  [OBS] n=" << sats.size()
+                          << " nG=" << nGps
+                          << " nC=" << nBds
+                          << " elev_deg=[" << elev_min * 180.0 / M_PI << "," << elev_max * 180.0 / M_PI << "]"
+                          << " trop_m=[" << trop_min << "," << trop_max << "]"
+                          << std::endl;
+            }
+
             Eigen::VectorXd dx;
             Eigen::VectorXd v;
             Eigen::MatrixXd H;
             if (!solveLeastSquares(sats, dx, v, H)) return false;
+
+            if (verbose_) {
+                std::cout << "    dx=(" << dx.transpose() << ")"
+                          << " vmax=" << v.cwiseAbs().maxCoeff()
+                          << std::endl;
+            }
 
             if (dx.size() == 4) {
                 rx_pos.x += dx(0);

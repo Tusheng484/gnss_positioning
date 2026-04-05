@@ -93,7 +93,8 @@ double HopfieldTropDelay(double H, double E, double T0, double p0, double RH0) {
     double Hw = 11000.0;
     double Hd = 40136.0 + 148.72 * (T0 - 273.16);
 
-    if (H >= Hd || H >= Hw) return 0.0;
+    if (H < -1000.0 || H > 10000.0) H = 0.0;
+    if (H >= Hd) return 0.0;
 
     double T = T0 - 0.0065 * H;
     if (!(T > 0.0)) return 0.0;
@@ -105,13 +106,20 @@ double HopfieldTropDelay(double H, double E, double T0, double p0, double RH0) {
 
     double Kd = 155.2e-7 * (p / T) * (Hd - H);
     double Kw = 155.2e-7 * (4810.0 * e / (T * T)) * (Hw - H);
+    if (H >= Hw) Kw = 0.0;
 
     double el_deg = el * 180.0 / ErrorConst::PI;
-    double md = 1.0 / std::sin(std::sqrt(el_deg * el_deg + 6.25) * ErrorConst::PI / 180.0);
-    double mw = 1.0 / std::sin(std::sqrt(el_deg * el_deg + 2.25) * ErrorConst::PI / 180.0);
+    double sin_d = std::sin(std::sqrt(el_deg * el_deg + 6.25) * ErrorConst::PI / 180.0);
+    double sin_w = std::sin(std::sqrt(el_deg * el_deg + 2.25) * ErrorConst::PI / 180.0);
+    if (sin_d < 0.1) sin_d = 0.1;
+    if (sin_w < 0.1) sin_w = 0.1;
+    double md = 1.0 / sin_d;
+    double mw = 1.0 / sin_w;
 
     double trop = Kd * md + Kw * mw;
-    if (!std::isfinite(trop) || trop < 0.0) return 0.0;
+    if (!std::isfinite(trop) || trop < 0.0 || trop > 50.0) {
+        return 2.3 / std::sin(el);
+    }
     return trop;
 }
 
@@ -149,4 +157,3 @@ double IonoL1ToFreq(double ionoL1, double f1, double f2) {
 }
 
 } // namespace gnss
-

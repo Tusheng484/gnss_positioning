@@ -190,6 +190,7 @@ public:
                   << " MATCH(G/B)=" << report.match_g << "/" << report.match_b
                   << " CLK(m)=" << report.clk_gps_m
                   << " ISB(m)=" << report.isb_bds_m
+                  << " PDOP=" << report.pdop
                   << std::endl;
     }
 
@@ -244,7 +245,7 @@ public:
             if (!spp_file_.is_open()) return false;
             spp_file_.setf(std::ios::fixed, std::ios::floatfield);
             spp_file_ << std::setprecision(3);
-            spp_file_ << "TOW OBS_G OBS_B EPH_G EPH_B MATCH_G MATCH_B ATTEMPT OK X(m) Y(m) Z(m) CLK_GPS(m) ISB_BDS(m)" << std::endl;
+            spp_file_ << "TOW OBS_G OBS_B EPH_G EPH_B MATCH_G MATCH_B ATTEMPT OK X(m) Y(m) Z(m) CLK_GPS(m) ISB_BDS(m) PDOP VEL_X(m/s) VEL_Y(m/s) VEL_Z(m/s) CLK_DRIFT_MS(ms)" << std::endl;
         }
 
         if (cfg_.file_sat_states) {
@@ -302,7 +303,9 @@ public:
                   << (report.attempted ? 1 : 0) << " "
                   << (report.ok ? 1 : 0) << " "
                   << report.pos.x << " " << report.pos.y << " " << report.pos.z << " "
-                  << report.clk_gps_m << " " << report.isb_bds_m
+                  << report.clk_gps_m << " " << report.isb_bds_m << " " << report.pdop << " "
+                  << report.vel.x << " " << report.vel.y << " "<< report.vel.z<<" "
+                  << report.clk_drift_ms<<" "
                   << std::endl;
     }
 
