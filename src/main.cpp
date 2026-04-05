@@ -4,6 +4,10 @@
  * @author Jiaoyang Wu
  * @date 2026-03-30
  *
+ * 修改历史：
+ * - 2026-03-30：建立模块化主流程（配置管理/终端输出/文件管理/核心解算），支持星历与观测落盘。
+ * - 2026-04-05：扩展 SPP 输出字段（PDOP/测速/钟漂等）并同步落盘格式（由 SPP 模块提供数据）。
+ *
  * 工程职责划分：
  * - 核心 SPP 算法模块：单点定位解算
  * - 终端输出模块：实时显示处理进度与关键结果
@@ -26,16 +30,28 @@
 #include <gnss_positioning/SPP.h>
 #include <gnss_positioning/SatPosCalc.h>
 #include <gnss_positioning/ErrorCorrection.h>
-/**
- * @brief 程序入口：驱动数据解码、预处理、SPP 解算与结果输出
- * @return 0: 正常退出；非 0: 异常退出
- */
+
 namespace {
 
+/**
+ * @brief 将“系统 + PRN”组合为可用于容器索引的键
+ * @param sys 卫星系统（GPS/BDS 等）
+ * @param prn 卫星 PRN 编号
+ * @return 键值（sys*1000 + prn），用于 map/unordered_map 等容器索引
+ */
 uint32_t MakeKey(gnss::GnssSystem sys, uint32_t prn) {
     return static_cast<uint32_t>(sys) * 1000U + prn;
 }
 
+/**
+ * @brief GPST 周内秒转 BDT 周内秒
+ * @param t_gpst GPST 周内秒，范围 [0, 604800)
+ * @return BDT 周内秒，范围 [0, 604800)
+ *
+ * 工程口径：
+ * - BDT = GPST - 14s（周内秒环绕处理）
+ * - 用于调用 BDS 广播星历卫星状态计算接口（其入口时标为 BDT）
+ */
 double GpstToBdtSec(double t_gpst) {
     double out = t_gpst - gnss::SppConst::BDT_GPS_OFFSET;
     while (out >= gnss::SppConst::WEEK_SEC) out -= gnss::SppConst::WEEK_SEC;
@@ -43,42 +59,222 @@ double GpstToBdtSec(double t_gpst) {
     return out;
 }
 
+/**
+ * @brief 运行时配置项（由命令行与配置文件驱动）
+ *
+ * 设计目的：
+ * - 将应用层“数据流驱动”与“算法/输出策略”解耦，避免在主循环中散落大量硬编码开关。
+ * - 支持通过配置文件热更新（可选）改变输出与算法开关，减少重复编译/部署成本。
+ */
 struct RuntimeConfig {
+    //=== INPUT/OUTPUT PATH CONFIGURATION ===================================//
+    /**
+     * @brief 输入数据路径（NovAtel OEM 二进制日志）
+     *
+     * 启用条件：
+     * - 程序启动必须可打开该文件，否则直接退出。
+     */
     std::string input_path = "D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log";
+    /**
+     * @brief 输出目录（落盘文件统一写入该目录）
+     *
+     * 启用条件：
+     * - file_output 为 true 时生效；
+     * - openAll() 会尝试创建该目录。
+     */
     std::string output_dir = "D:/gnss_positioning/output";
+    /**
+     * @brief 配置文件路径（key=value）
+     *
+     * 说明：
+     * - 为空表示不加载配置文件，仅使用命令行与默认值。
+     */
     std::string config_path;
+    /**
+     * @brief 配置文件热更新开关
+     *
+     * 依赖关系：
+     * - 仅当 config_path 非空时生效；
+     * - 每次 decoder 解码出一帧完整消息后检查 last_write_time 是否变化。
+     */
     bool watch_config = false;
 
+    //=== TERMINAL OUTPUT CONFIGURATION =====================================//
+    /**
+     * @brief 终端输出开关
+     *
+     * 控制范围：
+     * - 启动信息、每历元摘要、最终统计信息的输出。
+     *
+     * 依赖关系：
+     * - 不影响文件落盘；
+     * - 不影响算法执行，仅控制 std::cout 输出。
+     */
     bool terminal_output = false;
 
+    //=== FILE OUTPUT CONFIGURATION =========================================//
+    /**
+     * @brief 总落盘开关
+     *
+     * 控制范围：
+     * - false：不创建 output_dir，不打开任何输出文件，writeXxx() 直接返回；
+     * - true：按各子文件开关决定是否打开对应文件。
+     */
     bool file_output = true;
+    /**
+     * @brief SPP 解算结果落盘开关（spp_solution.txt）
+     *
+     * 依赖关系：
+     * - file_output 为 true；
+     * - enable_spp 为 true 时才会持续写入内容（未解算仅会有表头）。
+     */
     bool file_spp_solution = true;
+    /**
+     * @brief 卫星状态落盘开关（sat_states.txt）
+     *
+     * 依赖关系：
+     * - file_output 为 true；
+     * - enable_sat_state 为 true；
+     * - 仅对每历元 freqIdx==0 的卫星输出一条状态记录。
+     */
     bool file_sat_states = true;
+    /**
+     * @brief 星历落盘开关（gps_ephem.txt / bds_ephem.txt）
+     *
+     * 依赖关系：
+     * - file_output 为 true；
+     * - 仅当输入流中出现对应星历消息（ID=7/1696）时写入。
+     */
     bool file_ephemeris = true;
+    /**
+     * @brief 原始观测落盘开关（range_obs.txt）
+     *
+     * 依赖关系：
+     * - file_output 为 true；
+     * - 仅当输入流中出现 RANGE 消息（ID=43）时写入。
+     */
     bool file_observations = true;
 
+    //=== ALGORITHM CONFIGURATION ===========================================//
+    /**
+     * @brief 启用 SPP 单点定位解算
+     *
+     * 依赖关系：
+     * - true：每个 RANGE 历元调用 SPP::computeWithReport 输出定位结果；
+     * - false：跳过定位解算，仅进行星历/观测解析与（可选）卫星状态输出。
+     */
     bool enable_spp = true;
+    /**
+     * @brief 启用卫星状态计算与输出
+     *
+     * 依赖关系：
+     * - true：每个 RANGE 历元为可匹配星历的卫星计算广播星历状态并落盘；
+     * - false：不计算卫星状态（可降低运行成本）。
+     */
     bool enable_sat_state = true;
 
+    //=== QUALITY CONTROL CONFIGURATION =====================================//
+    /**
+     * @brief 高度角掩码（deg）
+     *
+     * 控制范围：
+     * - SPP 解算内部将低高度角卫星剔除/降权；
+     * - 该阈值过大将降低可用卫星数，过小将引入更强多路径/对流层残差影响。
+     */
     double elev_mask_deg = 10.0;
+    /**
+     * @brief SNR 掩码（dB-Hz）
+     *
+     * 控制范围：
+     * - SPP 解算仅使用 SNR 不低于该阈值的观测，降低低质量跟踪对解算的影响。
+     */
     double snr_mask_dbhz = 30.0;
+    /**
+     * @brief 启用无电离层组合（IF）伪距
+     *
+     * 启用条件：
+     * - 需要同一卫星同时存在 freqIdx=0 与 freqIdx=1 的有效伪距观测；
+     * - 若缺少第二频点，SPP 内会按策略跳过该卫星（以满足“单频不参与本次解算”的工程约束）。
+     */
     bool enable_iono_free = true;
 
+    /**
+     * @brief 启用落盘（便捷开关）
+     * @return 无
+     */
     void enableFileOutput() { file_output = true; }
+    /**
+     * @brief 禁用落盘（便捷开关）
+     * @return 无
+     */
     void disableFileOutput() { file_output = false; }
+    /**
+     * @brief 启用终端输出（便捷开关）
+     * @return 无
+     */
     void enableTerminalOutput() { terminal_output = true; }
+    /**
+     * @brief 禁用终端输出（便捷开关）
+     * @return 无
+     */
     void disableTerminalOutput() { terminal_output = false; }
+    /**
+     * @brief 启用 SPP（便捷开关）
+     * @return 无
+     */
     void enableSpp() { enable_spp = true; }
+    /**
+     * @brief 禁用 SPP（便捷开关）
+     * @return 无
+     */
     void disableSpp() { enable_spp = false; }
+    /**
+     * @brief 启用卫星状态落盘（便捷开关）
+     * @return 无
+     */
     void enableSatStateOutput() { file_sat_states = true; }
+    /**
+     * @brief 禁用卫星状态落盘（便捷开关）
+     * @return 无
+     */
     void disableSatStateOutput() { file_sat_states = false; }
 };
 
+/**
+ * @brief 配置管理器：命令行解析 + 配置文件加载 + 可选热更新
+ *
+ * 设计要点：
+ * - 命令行参数优先级最高（先写入 cfg_），随后若提供 config_path 则读取配置文件进行覆盖。
+ * - 热更新仅在 watch_config=true 且 config_path 非空时启用。
+ */
 class ConfigManager {
 public:
+    /**
+     * @brief 获取当前配置（只读）
+     * @return 配置只读引用
+     */
     const RuntimeConfig& config() const { return cfg_; }
+    /**
+     * @brief 获取当前配置（可写）
+     * @return 配置可写引用
+     */
     RuntimeConfig& config() { return cfg_; }
 
+    /**
+     * @brief 从命令行参数加载配置
+     * @param argc 参数数量
+     * @param argv 参数数组
+     * @return 无
+     *
+     * 支持的参数示例：
+     * - --input=xxx
+     * - --outdir=xxx
+     * - --config=xxx
+     * - --elev-mask=10.0
+     * - --snr-mask=30.0
+     * - --iono-free / --no-iono-free
+     * - --no-terminal / --no-file / --no-spp / --no-sat 等
+     */
     void loadFromArgs(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i] ? std::string(argv[i]) : std::string();
@@ -106,6 +302,14 @@ public:
         }
     }
 
+    /**
+     * @brief 配置文件热更新：检测文件时间戳变化后重新加载
+     * @return 无
+     *
+     * 运行机制：
+     * - 每当解码器解析到一帧完整消息后调用一次；
+     * - 若 last_write_time 与上次记录不同，则重新加载并更新缓存时间戳。
+     */
     void reloadIfChanged() {
         if (!cfg_.watch_config || cfg_.config_path.empty()) return;
         std::error_code ec;
@@ -119,6 +323,11 @@ public:
     }
 
 private:
+    /**
+     * @brief 从配置文件加载 key=value 并写入 cfg_
+     * @param path 配置文件路径
+     * @return true: 加载成功；false: 文件不可读或打开失败
+     */
     bool loadFromFile(const std::string& path) {
         std::ifstream in(path);
         if (!in.is_open()) return false;
@@ -150,12 +359,21 @@ private:
         return true;
     }
 
+    /**
+     * @brief 记录配置文件当前时间戳
+     * @return 无
+     */
     void updateConfigTimestamp() {
         std::error_code ec;
         last_ts_ = std::filesystem::last_write_time(cfg_.config_path, ec);
         has_ts_ = !ec;
     }
 
+    /**
+     * @brief 去除字符串首尾空白字符（空格/制表符/换行等）
+     * @param s 输入输出字符串
+     * @return 无
+     */
     static void trim(std::string& s) {
         auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
         while (!s.empty() && is_space(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
@@ -168,10 +386,27 @@ private:
     bool has_ts_ = false;
 };
 
+/**
+ * @brief 终端输出模块：负责运行过程中的可读性输出
+ *
+ * 说明：
+ * - 该模块仅做“展示”，不参与任何定位领域逻辑判断；
+ * - 输出开关由 RuntimeConfig::terminal_output 控制。
+ */
 class TerminalOutput {
 public:
+    /**
+     * @brief 设置终端输出是否启用
+     * @param enabled true: 输出；false: 静默
+     * @return 无
+     */
     void setEnabled(bool enabled) { enabled_ = enabled; }
 
+    /**
+     * @brief 输出启动信息（输入/输出路径、配置文件等）
+     * @param cfg 运行时配置
+     * @return 无
+     */
     void printStartup(const RuntimeConfig& cfg) {
         if (!enabled_) return;
         std::cout << std::fixed << std::setprecision(3);
@@ -181,6 +416,12 @@ public:
         if (!cfg.config_path.empty()) std::cout << "CONFIG=" << cfg.config_path << std::endl;
     }
 
+    /**
+     * @brief 输出单历元摘要（用于观察解算是否稳定、卫星匹配是否满足）
+     * @param report SPP 输出的历元报告
+     * @param ok 解算结果标志（true: 成功；false: 失败）
+     * @return 无
+     */
     void printEpoch(const gnss::SppEpochReport& report, bool ok) {
         if (!enabled_) return;
         if (!report.attempted) return;
@@ -194,6 +435,23 @@ public:
                   << std::endl;
     }
 
+    /**
+     * @brief 输出全流程统计摘要（用于处理量级与异常跳过原因分析）
+     * @param total_bytes 读取的总字节数
+     * @param range_frames RANGE 历元数量（消息 ID=43）
+     * @param gps_eph GPS 星历数量（消息 ID=7）
+     * @param bds_eph BDS 星历数量（消息 ID=1696）
+     * @param solve_attempt 实际进入 SPP 解算的历元数量
+     * @param spp_ok SPP 解算成功历元数量
+     * @param spp_fail SPP 解算失败历元数量
+     * @param skip_no_eph 由于无星历导致未尝试解算的历元数量
+     * @param skip_low_match 由于匹配星历不足导致未尝试解算的历元数量
+     * @param sat_total 卫星状态计算尝试次数（按历元×卫星计数）
+     * @param sat_no_eph 无星历导致未计算卫星状态次数
+     * @param sat_ok 卫星状态计算成功次数（函数返回 true）
+     * @param sat_valid 卫星状态数值有效次数（st.valid=true）
+     * @return 无
+     */
     void printSummary(uint32_t total_bytes,
                       uint32_t range_frames,
                       uint32_t gps_eph,
@@ -228,10 +486,26 @@ private:
     bool enabled_ = true;
 };
 
+/**
+ * @brief 文件管理模块：统一管理输出文件的创建、表头与逐历元写入
+ *
+ * 设计要点：
+ * - openAll() 负责创建输出目录并按开关打开文件与写入表头；
+ * - writeXxx() 负责在主循环中按需写入，所有写入函数均为“可重入安全”早返回形式；
+ * - 该模块不做任何定位领域计算，仅做格式化与落盘。
+ */
 class FileManager {
 public:
+    /**
+     * @brief 构造文件管理器
+     * @param cfg 运行时配置（引用保存，生命周期由调用方保证）
+     */
     explicit FileManager(const RuntimeConfig& cfg) : cfg_(cfg) {}
 
+    /**
+     * @brief 打开所有启用的输出文件并写入表头
+     * @return true: 成功；false: 目录创建或文件打开失败
+     */
     bool openAll() {
         if (!cfg_.file_output) return true;
 
@@ -293,6 +567,15 @@ public:
         return true;
     }
 
+    /**
+     * @brief 写入单历元 SPP 报告（spp_solution.txt）
+     * @param report SPP 历元报告
+     * @return 无
+     *
+     * 说明：
+     * - report.attempted / report.ok 等字段由 SPP 模块负责填充；
+     * - 此处仅按表头顺序输出，便于后处理脚本解析。
+     */
     void writeSppReport(const gnss::SppEpochReport& report) {
         if (!cfg_.file_output || !cfg_.file_spp_solution) return;
         if (!spp_file_.is_open()) return;
@@ -309,6 +592,11 @@ public:
                   << std::endl;
     }
 
+    /**
+     * @brief 写入卫星状态文件的历元分隔头（通用时 + GPS 周/周内秒）
+     * @param gps_time 当前历元的 GPS 时间（周+周内秒）
+     * @return 无
+     */
     void writeSatEpochHeader(const gnss::GPSTIME& gps_time) {
         if (!cfg_.file_output || !cfg_.file_sat_states) return;
         if (!sat_file_.is_open()) return;
@@ -320,6 +608,17 @@ public:
         sat_file_ << "* " << gps_time.Week << " " << std::fixed << std::setprecision(8) << gps_time.SecOfWeek << std::endl;
     }
 
+    /**
+     * @brief 写入单颗卫星的广播星历状态（sat_states.txt）
+     * @param sys 卫星系统（GPS/BDS）
+     * @param prn 卫星 PRN
+     * @param st 卫星状态（位置/速度/钟差/钟速）
+     * @return 无
+     *
+     * 注意：
+     * - 输出文件用于验证卫星广播轨道计算口径；
+     * - “B”前缀表示仅广播星历状态，不叠加 SPP 观测改正项。
+     */
     void writeSatStateLine(gnss::GnssSystem sys, uint32_t prn, const gnss::SatState& st) {
         if (!cfg_.file_output || !cfg_.file_sat_states) return;
         if (!sat_file_.is_open()) return;
@@ -337,6 +636,11 @@ public:
                   << std::endl;
     }
 
+    /**
+     * @brief 写入 GPS 星历（gps_ephem.txt）
+     * @param e GPS 星历结构体（来自解码器缓存）
+     * @return 无
+     */
     void writeGpsEphem(const gnss::GpsEphem& e) {
         if (!cfg_.file_output || !cfg_.file_ephemeris) return;
         if (!gps_eph_file_.is_open()) return;
@@ -369,6 +673,11 @@ public:
                       << std::endl;
     }
 
+    /**
+     * @brief 写入 BDS 星历（bds_ephem.txt）
+     * @param e BDS 星历结构体（来自解码器缓存）
+     * @return 无
+     */
     void writeBdsEphem(const gnss::BdsEphem& e) {
         if (!cfg_.file_output || !cfg_.file_ephemeris) return;
         if (!bds_eph_file_.is_open()) return;
@@ -400,6 +709,13 @@ public:
                       << std::endl;
     }
 
+    /**
+     * @brief 写入 RANGE 观测（range_obs.txt）
+     * @param week 当前 GPS 周
+     * @param tow 当前周内秒（GPST）
+     * @param obs_list 当前历元观测列表
+     * @return 无
+     */
     void writeObs(uint16_t week, double tow, const std::vector<gnss::ObsData>& obs_list) {
         if (!cfg_.file_output || !cfg_.file_observations) return;
         if (!obs_file_.is_open()) return;
@@ -415,10 +731,21 @@ public:
         }
     }
 
+    /**
+     * @brief 获取 spp_solution.txt 输出路径（若未启用则为空字符串）
+     * @return 输出路径引用
+     */
     const std::string& sppPath() const { return spp_path_; }
+    /**
+     * @brief 获取 sat_states.txt 输出路径（若未启用则为空字符串）
+     * @return 输出路径引用
+     */
     const std::string& satPath() const { return sat_path_; }
 
 private:
+    /**
+     * @brief 运行时配置引用（由 main() 生命周期托管）
+     */
     const RuntimeConfig& cfg_;
 
     std::ofstream spp_file_;
@@ -434,8 +761,19 @@ private:
     std::string obs_path_;
 };
 
+/**
+ * @brief SPP 核心封装：隔离 main() 与 SPP 模块接口细节
+ *
+ * 设计目的：
+ * - main() 负责数据流与 I/O；SPP 负责定位领域逻辑；
+ * - 在此处集中注入运行时参数（高度角掩码、SNR 掩码、IF 开关等）。
+ */
 class SppCore {
 public:
+    /**
+     * @brief 构造并初始化 SPP 解算器参数
+     * @param cfg 运行时配置
+     */
     explicit SppCore(const RuntimeConfig& cfg) {
         solver_.setElevationMaskDeg(cfg.elev_mask_deg);
         solver_.setSnrMaskDbHz(cfg.snr_mask_dbhz);
@@ -443,6 +781,14 @@ public:
         solver_.setVerbose(false);
     }
 
+    /**
+     * @brief 执行单历元 SPP 解算并生成报告
+     * @param tow_gpst 历元时刻（GPST 周内秒）
+     * @param obs_list 当前历元观测列表
+     * @param eph_list 当前可用星历列表
+     * @param report 输出的历元报告
+     * @return true: 解算成功；false: 解算失败或数据不足
+     */
     bool compute(double tow_gpst,
                  const std::vector<gnss::ObsData>& obs_list,
                  const std::vector<gnss::Ephemeris>& eph_list,
@@ -450,14 +796,38 @@ public:
         return solver_.computeWithReport(tow_gpst, obs_list, eph_list, report);
     }
 
+    /**
+     * @brief 获取最近一次解算位置（ECEF）
+     * @return {X,Y,Z} 米
+     */
     std::vector<double> lastPosition() const { return solver_.getPosition(); }
 
 private:
     gnss::SPP solver_;
 };
 
+/**
+ * @brief 卫星状态计算封装：基于广播星历输出卫星位置/速度/钟差/钟速
+ *
+ * 说明：
+ * - 用于生成 sat_states.txt（验证广播轨道计算）；
+ * - 与 SPP 定位解算解耦：即使不启用 SPP，也可单独输出卫星状态用于诊断。
+ */
 class SatStateCore {
 public:
+    /**
+     * @brief 在指定 GPST 周内秒计算单颗卫星状态
+     * @param sys 卫星系统
+     * @param prn 卫星 PRN
+     * @param tow_gpst 计算时刻（GPST 周内秒）
+     * @param eph 统一格式星历（由解码器转换得到）
+     * @param st 输出卫星状态
+     * @return true: 计算成功；false: 不支持系统或计算失败
+     *
+     * 时间口径：
+     * - GPS：直接使用 GPST；
+     * - BDS：ComputeBdsSatState 接口使用 BDT，因此在此处做 GPST->BDT 转换。
+     */
     static bool computeAtTow(gnss::GnssSystem sys,
                              uint32_t prn,
                              double tow_gpst,
@@ -475,6 +845,11 @@ public:
     }
 
 private:
+    /**
+     * @brief 统一星历转 GPS 广播星历输入结构体（字段搬运）
+     * @param eph 统一星历
+     * @return GPS 星历输入结构体
+     */
     static gnss::GpsEph toGpsEph(const gnss::Ephemeris& eph) {
         gnss::GpsEph out;
         out.prn = eph.prn;
@@ -502,6 +877,11 @@ private:
         return out;
     }
 
+    /**
+     * @brief 统一星历转 BDS 广播星历输入结构体（字段搬运）
+     * @param eph 统一星历
+     * @return BDS 星历输入结构体
+     */
     static gnss::BdsEph toBdsEph(const gnss::Ephemeris& eph) {
         gnss::BdsEph out;
         out.prn = eph.prn;
@@ -532,6 +912,20 @@ private:
 
 } // namespace
 
+/**
+ * @brief 程序入口：驱动数据解码、预处理、SPP 解算与结果输出
+ * @param argc 命令行参数数量
+ * @param argv 命令行参数数组
+ * @return 0: 正常退出；非 0: 异常退出
+ *
+ * 主流程（按数据流驱动组织）：
+ * 1) 读取命令行与配置文件（可选热更新）
+ * 2) 初始化终端输出与输出文件
+ * 3) 流式读取 OEM 二进制数据，解码消息帧
+ * 4) 星历消息：缓存并落盘
+ * 5) 观测消息：落盘、可选卫星状态输出、可选 SPP 解算输出
+ * 6) 输出最终统计摘要
+ */
 int main(int argc, char** argv) {
     try {
         ConfigManager cfg_mgr;
@@ -541,23 +935,29 @@ int main(int argc, char** argv) {
         term.setEnabled(cfg_mgr.config().terminal_output);
         term.printStartup(cfg_mgr.config());
 
+        // 打开输入文件（OEM 二进制日志）。
         std::ifstream in_file(cfg_mgr.config().input_path, std::ios::binary);
         if (!in_file.is_open()) {
             std::cerr << "[ERROR] 无法打开输入文件: " << cfg_mgr.config().input_path << std::endl;
             return 1;
         }
 
+        // 初始化输出目录与各类落盘文件（由配置控制）。
         FileManager files(cfg_mgr.config());
         if (!files.openAll()) {
             std::cerr << "[ERROR] 输出文件初始化失败: " << cfg_mgr.config().output_dir << std::endl;
             return 1;
         }
 
+        // 初始化解码器与 SPP 解算核心。
         gnss::NovatelDecoder decoder;
         SppCore spp(cfg_mgr.config());
 
+        // 星历缓存：key=(sys,prn) -> Ephemeris。
+        // 生命周期：贯穿整个程序运行，随着消息流持续更新（用于后续历元的星历匹配）。
         std::map<uint32_t, gnss::Ephemeris> eph_store;
 
+        // 统计变量：用于终端输出 SUMMARY，与性能无关，生命周期贯穿 main()。
         uint32_t total_bytes = 0;
         uint32_t range_frames = 0;
         uint32_t gps_eph_count = 0;
@@ -578,16 +978,19 @@ int main(int argc, char** argv) {
         std::vector<double> last_ok_pos;
         double last_ok_clk_m = 0.0;
 
+        // 主循环：逐字节喂给解码器，解码出完整消息帧后按消息类型分发处理。
         uint8_t byte = 0;
         while (in_file.read(reinterpret_cast<char*>(&byte), 1)) {
             total_bytes++;
             if (!decoder.inputData(byte)) continue;
 
+            // 配置热更新：仅在 watch_config=true 时生效。
             cfg_mgr.reloadIfChanged();
             term.setEnabled(cfg_mgr.config().terminal_output);
 
             uint16_t msg_id = decoder.getMsgId();
 
+            // 消息 ID=7：GPSEPHEM（GPS 广播星历）。
             if (msg_id == 7) {
                 const auto& gps_eph = decoder.getGpsEphem();
                 if (gps_eph.prn >= 1 && gps_eph.prn <= 32) {
@@ -598,6 +1001,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // 消息 ID=1696：BDSEPHEMERIS（BDS 广播星历）。
             if (msg_id == 1696) {
                 const auto& bds_eph = decoder.getBdsEphem();
                 if (bds_eph.prn >= 1 && bds_eph.prn <= 63) {
@@ -608,6 +1012,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // 消息 ID=43：RANGE（观测数据）。其他消息类型在当前主程序中忽略。
             if (msg_id != 43) continue;
 
             range_frames++;
@@ -615,11 +1020,13 @@ int main(int argc, char** argv) {
             const auto& obs_list = decoder.getObsData();
             files.writeObs(decoder.getWeek(), tow, obs_list);
 
+            // 卫星状态文件按历元写入两行时间头，便于后处理按历元分段解析。
             gnss::GPSTIME gps_time;
             gps_time.Week = decoder.getWeek();
             gps_time.SecOfWeek = tow;
             files.writeSatEpochHeader(gps_time);
 
+            // 卫星状态输出：对本历元出现的（GPS/BDS、freqIdx=0）卫星，若能匹配到星历则计算状态并写入。
             if (cfg_mgr.config().enable_sat_state && cfg_mgr.config().file_output && cfg_mgr.config().file_sat_states) {
                 std::map<uint32_t, gnss::ObsData> uniq_obs;
                 for (const auto& obs : obs_list) {
@@ -644,16 +1051,20 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // SPP 解算开关：禁用时跳过定位，仅完成解析与落盘。
             if (!cfg_mgr.config().enable_spp) continue;
 
+            // 将当前缓存的全部星历转为线性列表（SPP 内部自行按 sys/prn 匹配）。
             std::vector<gnss::Ephemeris> eph_list;
             eph_list.reserve(eph_store.size());
             for (const auto& kv : eph_store) eph_list.push_back(kv.second);
 
+            // 单历元 SPP 解算：输出 report（用于终端摘要与落盘）。
             gnss::SppEpochReport report;
             bool ok = spp.compute(tow, obs_list, eph_list, report);
             term.printEpoch(report, ok);
 
+            // 统计与落盘：attempted 表示满足基本条件并进入解算流程。
             if (report.attempted) solve_attempt++;
             if (ok) spp_ok++;
             else spp_fail++;
@@ -662,6 +1073,7 @@ int main(int argc, char** argv) {
 
             files.writeSppReport(report);
 
+            // 记录首个成功历元与最近成功历元（用于终端快速定位结果范围）。
             if (ok) {
                 if (!has_first_ok) {
                     has_first_ok = true;
@@ -673,6 +1085,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        // 终端输出：全流程统计摘要。
         term.printSummary(total_bytes,
                           range_frames,
                           gps_eph_count,
@@ -687,12 +1100,14 @@ int main(int argc, char** argv) {
                           sat_ok,
                           sat_valid);
 
+        // 终端输出：首个成功历元与最后成功历元的快照（便于确认是否全程稳定）。
         if (cfg_mgr.config().terminal_output && has_first_ok && last_ok_pos.size() == 3) {
             std::cout << "FIRST_OK_TOW=" << first_ok_tow << " LAST_OK_TOW=" << last_ok_tow << std::endl;
             std::cout << "LAST_OK_XYZ=" << last_ok_pos[0] << "," << last_ok_pos[1] << "," << last_ok_pos[2]
                       << " LAST_OK_CLK(m)=" << last_ok_clk_m << std::endl;
         }
 
+        // 终端输出：输出目录提示（便于脚本或人工定位输出文件位置）。
         if (cfg_mgr.config().terminal_output && cfg_mgr.config().file_output) {
             std::cout << "OUTPUT_DIR=" << cfg_mgr.config().output_dir << std::endl;
         }
