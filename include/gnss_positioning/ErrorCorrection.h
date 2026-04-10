@@ -42,6 +42,18 @@ struct ErrorConst {
 double HopfieldTropDelay(double H, double E, double T0 = 288.16, double p0 = 1013.25, double RH0 = 50.0);
 
 /**
+ * @brief Saastamoinen 对流层延迟模型（标准气象参数默认值）
+ * @param lat 测站纬度，单位：弧度 (rad)
+ * @param H 测站大地高，单位：米 (m)
+ * @param E 卫星高度角，单位：弧度 (rad)
+ * @param T0 参考面温度，单位：开尔文 (K)，默认 288.15K
+ * @param p0 参考面气压，单位：毫巴 (mbar)，默认 1013.25mbar
+ * @param RH0 参考面相对湿度，单位：百分比 (%)，默认 50%
+ * @return 对流层斜路径延迟改正量，单位：米 (m)
+ */
+double SaastamoinenTropDelay(double lat, double H, double E, double T0 = 288.15, double p0 = 1013.25, double RH0 = 50.0);
+
+/**
  * @brief GPS Klobuchar 电离层延迟模型（L1 等效）
  * @param tow GPS 周内秒，单位：秒 (s)
  * @param pos 测站位置 [lat, lon, h]，lat/lon 为弧度，h 为米

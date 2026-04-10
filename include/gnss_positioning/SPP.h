@@ -287,6 +287,7 @@ private:
      * @return true: 检测为粗差；false: 未检测为粗差
      */
     bool DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m) const;
+
     /**
      * @brief 由接收时刻与伪距计算信号发射时刻近似值
      * @param t_rx_gpst 接收时刻（GPST 周内秒）
@@ -367,6 +368,15 @@ private:
     int detectOutliers(std::vector<SatCalc>& sats, const Eigen::VectorXd& v, double sigma0) const;
 
 private:
+    static constexpr double kDefaultElevMaskDeg = 10.0;
+    static constexpr double kDefaultSnrMaskDbHz = 30.0;
+    static constexpr double kGfDgfThresholdM = 2.0;
+    static constexpr double kGfMaxGapSec = 10.0;
+    static constexpr double kRaimPseudorangeSigmaM = 3.0;
+    static constexpr double kRaimSigmaFactor = 3.0;
+    static constexpr int kRaimMaxIter = 3;
+    static constexpr double kSigmaZenithM = 0.3; ///< 天顶方向伪距噪声 (m)
+
     SppSolution sol_;
     int last_rejected_ = 0;
     bool last_vel_ok_ = false;

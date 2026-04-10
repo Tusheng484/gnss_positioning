@@ -153,7 +153,7 @@ Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph) {
     return eph;
 }
 
-SPP::SPP() : max_iter_(10), conv_m_(1e-4), elev_mask_deg_(10.0), snr_mask_dbhz_(30.0), enable_iono_free_(true), verbose_(false) {
+SPP::SPP() : max_iter_(10), conv_m_(1e-4), elev_mask_deg_(kDefaultElevMaskDeg), snr_mask_dbhz_(kDefaultSnrMaskDbHz), enable_iono_free_(true), verbose_(false) {
     sol_.pos.x = 0.0;
     sol_.pos.y = 0.0;
     sol_.pos.z = 0.0;
@@ -318,7 +318,7 @@ bool SPP::DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m
     }
 
     const double dt = normalizeTimeSec(current_tow_gpst_ - it->second.tow_gpst);
-    if (std::abs(dt) > 10.0) {
+    if (std::abs(dt) > kGfMaxGapSec) {
         it->second = PrevGf{current_tow_gpst_, gf_m};
         return false;
     }
@@ -326,8 +326,7 @@ bool SPP::DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m
     dgf_m = gf_m - it->second.gf_m;
     if (!std::isfinite(dgf_m)) return true;
 
-    const double kDgfThresholdM = 2.0;
-    if (std::abs(dgf_m) > kDgfThresholdM) {
+    if (std::abs(dgf_m) > kGfDgfThresholdM) {
         return true;
     }
 
@@ -488,7 +487,9 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         }
 
         double tropo = 0.0;
-        if (rx_geo_ok) tropo = HopfieldTropDelay(rx_blh.height, elev);
+        if (rx_geo_ok) {
+            tropo = SaastamoinenTropDelay(rx_blh.latitude, rx_blh.height, elev);
+        }
 
         double P_corr = o.P + SppConst::C * sc.clk_s;
 
@@ -555,10 +556,10 @@ bool SPP::solveLeastSquares(const std::vector<SatCalc>& sats,
         H(i, 3) = 1.0;
         if (n == 5) H(i, 4) = (s.system == GnssSystem::BDS) ? 1.0 : 0.0;
 
-        double wi = std::sin(std::max(s.elev_rad, deg2rad(5.0)));
-        wi = wi * wi;
-        if (wi < 0.01) wi = 0.01;
-        w(i) = wi;
+        double sin_e = std::sin(std::max(s.elev_rad, deg2rad(5.0)));
+        if (sin_e < 0.1) sin_e = 0.1;
+        double pi = (sin_e / kSigmaZenithM);
+        w(i) = pi * pi;
     }
 
     Eigen::MatrixXd A = H;
@@ -606,10 +607,10 @@ bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eig
         const double proj_vs = (dx * s.vel_ecef.x + dy * s.vel_ecef.y + dz * s.vel_ecef.z) / rho;
         y(i) = s.doppler_ms - proj_vs + SppConst::C * s.clk_drift_s;
 
-        double wi = std::sin(std::max(s.elev_rad, deg2rad(5.0)));
-        wi = wi * wi;
-        if (wi < 0.01) wi = 0.01;
-        w(i) = wi;
+        double sin_e = std::sin(std::max(s.elev_rad, deg2rad(5.0)));
+        if (sin_e < 0.1) sin_e = 0.1;
+        double pi = (sin_e / kSigmaZenithM);
+        w(i) = pi * pi;
     }
 
     Eigen::MatrixXd A = H;
@@ -693,7 +694,8 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     std::vector<SatCalc> sats_last;
     double sigma0_last = 0.0;
 
-    for (int out_round = 0; out_round < 2; ++out_round) {
+    const double raim_threshold_m = kRaimSigmaFactor * kRaimPseudorangeSigmaM;
+    for (int raim_iter = 0; raim_iter < kRaimMaxIter; ++raim_iter) {
         bool converged = false;
         for (int iter = 0; iter < max_iter_; ++iter) {
             sol_.pos = rx_pos;
@@ -782,10 +784,10 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
 
             Eigen::VectorXd w(sats.size());
             for (int i = 0; i < static_cast<int>(sats.size()); ++i) {
-                double wi = std::sin(std::max(sats[i].elev_rad, deg2rad(5.0)));
-                wi = wi * wi;
-                if (wi < 0.01) wi = 0.01;
-                w(i) = wi;
+                double sin_e = std::sin(std::max(sats[i].elev_rad, deg2rad(5.0)));
+                if (sin_e < 0.1) sin_e = 0.1;
+                double pi = (sin_e / kSigmaZenithM);
+                w(i) = pi * pi;
             }
             const int dof = static_cast<int>(sats.size()) - static_cast<int>(H.cols());
             sigma0_last = 0.0;
@@ -799,27 +801,29 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
 
         if (!converged) return false;
 
-        std::vector<SatCalc> sats_candidate = sats_last;
-        const int nrej = detectOutliers(sats_candidate, v_last, sigma0_last);
-        if (nrej <= 0) break;
+        if (v_last.size() != static_cast<int>(sats_last.size()) || v_last.size() == 0) break;
+        int idx_max = 0;
+        double vmax = 0.0;
+        for (int i = 0; i < v_last.size(); ++i) {
+            const double a = std::abs(v_last(i));
+            if (a > vmax) { vmax = a; idx_max = i; }
+        }
+
+        if (vmax <= raim_threshold_m) break;
 
         int nGps = 0;
         int nBds = 0;
-        int nValid = 0;
-        for (const auto& s : sats_candidate) {
-            if (!s.valid) continue;
-            nValid++;
+        for (const auto& s : sats_last) {
             if (s.system == GnssSystem::GPS) nGps++;
             else if (s.system == GnssSystem::BDS) nBds++;
         }
         const bool dual = (nGps > 0 && nBds > 0);
         const int required = dual ? 5 : 4;
-        if (nValid < required) break;
+        if (static_cast<int>(sats_last.size()) - 1 < required) break;
 
-        for (const auto& s : sats_candidate) {
-            if (!s.valid) rejected_keys.insert(makeKey(s.system, s.prn));
-        }
-        last_rejected_ += nrej;
+        const auto& s_bad = sats_last[idx_max];
+        rejected_keys.insert(makeKey(s_bad.system, s_bad.prn));
+        last_rejected_ += 1;
     }
 
     sol_.pos = rx_pos;

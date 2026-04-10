@@ -123,6 +123,37 @@ double HopfieldTropDelay(double H, double E, double T0, double p0, double RH0) {
     return trop;
 }
 
+double SaastamoinenTropDelay(double lat, double H, double E, double T0, double p0, double RH0) {
+    if (!std::isfinite(lat) || !std::isfinite(H) || !std::isfinite(E) || !std::isfinite(T0) || !std::isfinite(p0) || !std::isfinite(RH0)) {
+        return 0.0;
+    }
+
+    double el = E;
+    double el_min = 5.0 * ErrorConst::PI / 180.0;
+    if (el < el_min) el = el_min;
+
+    if (H < -1000.0 || H > 10000.0) H = 0.0;
+
+    double T = T0 - 0.0065 * H;
+    if (!(T > 0.0)) return 0.0;
+    double p = p0 * std::pow(1.0 - 0.0000226 * H, 5.225);
+
+    double RH = Clamp(RH0 / 100.0, 0.0, 1.0);
+    double e = RH * std::exp(-37.2465 + 0.213166 * T - 0.000256908 * T * T);
+
+    double denom = 1.0 - 0.00266 * std::cos(2.0 * lat) - 0.00028 * (H / 1000.0);
+    if (std::abs(denom) < 1e-6) denom = (denom >= 0.0) ? 1e-6 : -1e-6;
+
+    double ZHD = 0.0022768 * p / denom;
+    double ZWD = 0.0022768 * (1255.0 / T + 0.05) * e;
+    double ZTD = ZHD + ZWD;
+
+    double m = 1.0 / std::sin(el);
+    double trop = ZTD * m;
+    if (!std::isfinite(trop) || trop < 0.0 || trop > 50.0) return 0.0;
+    return trop;
+}
+
 double GPSKlobucharIonoDelay(double tow,
                              const double pos[3],
                              double az,
