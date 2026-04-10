@@ -240,6 +240,7 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
         const auto& fo = kv.second;
         if (!fo.has0) continue;
         if (enable_iono_free_ && !fo.has1) continue;
+        if (enable_iono_free_ && !CheckOBSConsist(fo.P0, fo.P1)) continue;
 
         ProcObs po;
         po.system = fo.sys;
@@ -250,6 +251,9 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
         po.doppler = fo.dop0;
         po.wavelength = 0.0;
         po.has_doppler = std::isfinite(po.doppler);
+        po.gf_m = 0.0;
+        po.dgf_m = 0.0;
+        po.gf_outlier = false;
 
         if (fo.sys == GnssSystem::GPS) {
             po.wavelength = SppConst::C / ErrorConst::GPS_L1;
@@ -258,6 +262,19 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
         }
 
         if (enable_iono_free_ && fo.has1) {
+            const double gf_m = fo.P0 - fo.P1;
+            double dgf_m = 0.0;
+            if (DetectOutlier(fo.sys, fo.prn, gf_m, dgf_m)) {
+                po.gf_m = gf_m;
+                po.dgf_m = dgf_m;
+                po.gf_outlier = true;
+                out.push_back(po);
+                continue;
+            }
+            po.gf_m = gf_m;
+            po.dgf_m = dgf_m;
+            po.gf_outlier = false;
+
             double f1 = 0.0;
             double f2 = 0.0;
             if (fo.sys == GnssSystem::GPS) {
@@ -281,6 +298,41 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
     }
 
     return out;
+}
+
+bool SPP::CheckOBSConsist(double P1, double P2) const {
+    if (!std::isfinite(P1) || !std::isfinite(P2)) return false;
+    if (!(P1 > 0.0) || !(P2 > 0.0)) return false;
+    return true;
+}
+
+bool SPP::DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m) const {
+    dgf_m = 0.0;
+    if (!std::isfinite(gf_m)) return true;
+
+    const uint32_t key = makeKey(sys, prn);
+    auto it = prev_gf_.find(key);
+    if (it == prev_gf_.end()) {
+        prev_gf_[key] = PrevGf{current_tow_gpst_, gf_m};
+        return false;
+    }
+
+    const double dt = normalizeTimeSec(current_tow_gpst_ - it->second.tow_gpst);
+    if (std::abs(dt) > 10.0) {
+        it->second = PrevGf{current_tow_gpst_, gf_m};
+        return false;
+    }
+
+    dgf_m = gf_m - it->second.gf_m;
+    if (!std::isfinite(dgf_m)) return true;
+
+    const double kDgfThresholdM = 2.0;
+    if (std::abs(dgf_m) > kDgfThresholdM) {
+        return true;
+    }
+
+    it->second = PrevGf{current_tow_gpst_, gf_m};
+    return false;
 }
 
 double SPP::computeTransmitTime(double t_rx_gpst, double pseudorange_m) const {
@@ -354,7 +406,7 @@ bool SPP::computeSatState(double t_rx_gpst,
     satCalc.vel_ecef.z = vz;
 
     satCalc.clk_s = st_corr.clk_s;
-    if (proc.iono_free) satCalc.clk_s += eph.tgd;
+    if (!proc.iono_free) satCalc.clk_s -= eph.tgd;
     satCalc.clk_drift_s = st_corr.clk_drift;
 
     satCalc.has_doppler = proc.has_doppler && (proc.wavelength > 0.0) && std::isfinite(proc.doppler);
@@ -396,6 +448,7 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
     satCalcs.reserve(procObs.size());
 
     for (const auto& o : procObs) {
+        if (o.gf_outlier) continue;
         SatCalc sc;
         sc.system = o.system;
         sc.prn = o.prn;
@@ -617,8 +670,13 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     sol_.vel = {0.0, 0.0, 0.0};
     sol_.clk_drift_ms = 0.0;
 
+    current_tow_gpst_ = t_rx_gpst;
     std::vector<ProcObs> procObs = preprocessObservations(obsList);
-    if (procObs.size() < 4) return false;
+    int usable_obs = 0;
+    for (const auto& o : procObs) {
+        if (!o.gf_outlier) usable_obs++;
+    }
+    if (usable_obs < 4) return false;
 
     XYZ rx_pos = sol_.pos;
     double clk_gps_m = sol_.clk_gps_m;

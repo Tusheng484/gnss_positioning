@@ -26,7 +26,7 @@ constexpr double kOmegaEGps = 7.2921151467e-5;
 
 // BDS（CGCS2000）轨道动力学常量。
 constexpr double kMuBds = 3.986004418e14;
-constexpr double kOmegaEBds = 7.2921151467e-5;
+constexpr double kOmegaEBds = 7.2921150e-5;
 
 // 相对论改正：Δtr = F * e * sqrt(A) * sin(E)。
 constexpr double kRelF = -4.442807633e-10;
@@ -277,7 +277,7 @@ bool ComputeClock(double t,
     double relativity = kRelF * ecc * sqrtA * std::sin(Ek);
     double relativity_dot = kRelF * ecc * sqrtA * std::cos(Ek) * E_dot;
 
-    clk_s = af0 + af1 * dt + af2 * dt * dt + relativity - tgd;
+    clk_s = af0 + af1 * dt + af2 * dt * dt + relativity;
     clk_drift = af1 + 2.0 * af2 * dt + relativity_dot;
 
     return IsFinite(clk_s) && IsFinite(clk_drift);

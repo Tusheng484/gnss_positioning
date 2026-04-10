@@ -9,6 +9,7 @@
 #define SPP_H
 
 #include <vector>
+#include <map>
 #include <Eigen/Dense>
 #include "gnss_positioning/NovatelDecoder.h"
 #include "gnss_positioning/NavMath.h"
@@ -213,6 +214,10 @@ private:
         double doppler = 0.0;    ///< 多普勒观测值 (Hz)，正值表示卫星接近
         double wavelength = 0.0; ///< 对应载波波长 (m)
         bool has_doppler = false;///< 是否存在有效多普勒观测
+
+        double gf_m = 0.0;        ///< GF 组合：P1 - P2 (m)
+        double dgf_m = 0.0;       ///< 历元间 GF 差分：GF(t) - GF(t-1) (m)
+        bool gf_outlier = false;  ///< GF 粗差标记
     };
 
     /**
@@ -264,6 +269,24 @@ private:
      * @return 预处理后的观测列表
      */
     std::vector<ProcObs> preprocessObservations(const std::vector<ObsData>& obsList) const;
+
+    /**
+     * @brief 观测值一致性检验（双频伪距基本有效性检查）
+     * @param P1 频点 1 伪距 (m)
+     * @param P2 频点 2 伪距 (m)
+     * @return true: 观测有效；false: 观测无效
+     */
+    bool CheckOBSConsist(double P1, double P2) const;
+
+    /**
+     * @brief 基于 GF 组合的粗差探测（历元间差分）
+     * @param sys 卫星系统
+     * @param prn 卫星 PRN
+     * @param gf_m 当前历元 GF 值 (m)
+     * @param dgf_m 输出历元间差分 dGF (m)
+     * @return true: 检测为粗差；false: 未检测为粗差
+     */
+    bool DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m) const;
     /**
      * @brief 由接收时刻与伪距计算信号发射时刻近似值
      * @param t_rx_gpst 接收时刻（GPST 周内秒）
@@ -347,6 +370,12 @@ private:
     SppSolution sol_;
     int last_rejected_ = 0;
     bool last_vel_ok_ = false;
+    mutable double current_tow_gpst_ = 0.0;
+    struct PrevGf {
+        double tow_gpst = 0.0;
+        double gf_m = 0.0;
+    };
+    mutable std::map<uint32_t, PrevGf> prev_gf_;
     int max_iter_;
     double conv_m_;
     double elev_mask_deg_;

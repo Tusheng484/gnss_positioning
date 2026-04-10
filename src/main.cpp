@@ -561,7 +561,7 @@ public:
             if (!obs_file_.is_open()) return false;
             obs_file_.setf(std::ios::fixed, std::ios::floatfield);
             obs_file_ << std::setprecision(3);
-            obs_file_ << "WEEK TOW SYS PRN FREQIDX P(m) L(cycle) D(Hz) SNR(dBHz) STATUS" << std::endl;
+            obs_file_ << "WEEK TOW SYS PRN FREQIDX P(m) L(cycle) D(Hz) SNR(dBHz)" << std::endl;
         }
 
         return true;
@@ -725,8 +725,7 @@ public:
             else if (o.system == gnss::GnssSystem::BDS) sys_char = 'C';
             obs_file_ << week << " " << tow << " " << sys_char << " " << o.prn << " " << o.freqIdx << " "
                       << o.pseudorange << " " << o.carrierPhase << " "
-                      << static_cast<double>(o.doppler) << " " << static_cast<double>(o.snr) << " "
-                      << o.status
+                      << static_cast<double>(o.doppler) << " " << static_cast<double>(o.snr) 
                       << std::endl;
         }
     }
