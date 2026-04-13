@@ -285,6 +285,78 @@ bool ComputeClock(double t,
 
 } // namespace
 
+static constexpr double kC = 299792458.0;
+
+bool ComputeGpsSatStateIterative(const GpsEph& eph, double t_rx_gpst, double pseudorange_m, const Vec3& rx_pos_approx, SatState& state) {
+    // 根据《标准单点定位与测速》要求：
+    // 使用迭代法计算信号传播时间 Δt。
+    // 初始设置 Δt0 = 75 ms，根据计算出的卫星坐标重算 Δt1 = ρ / c，判断 |Δt1 - Δt0| 是否满足收敛条件。
+    if (!(pseudorange_m > 1.0)) return false;
+
+    // 初始设置信号传播时间为 75 ms (0.075 s)
+    double dt = 0.075;
+    SatState st_temp{};
+
+    for (int k = 0; k < 3; ++k) {
+        // t_tr = t_r - dt
+        double t_tx = t_rx_gpst - dt;
+        
+        // 第一次不带 Sagnac 效应计算卫星钟差
+        if (!ComputeGpsSatState(eph, t_tx, 0.0, st_temp)) return false;
+        
+        // t_tr = t_r - dt - δt_s (扣除卫星钟差)
+        double t_tx_corr = t_tx - st_temp.clk_s;
+        
+        // 第二次带 Sagnac 效应计算卫星位置和速度
+        if (!ComputeGpsSatState(eph, t_tx_corr, dt, state)) return false;
+
+        const double dx = state.pos_ecef.x - rx_pos_approx.x;
+        const double dy = state.pos_ecef.y - rx_pos_approx.y;
+        const double dz = state.pos_ecef.z - rx_pos_approx.z;
+        const double rho = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!(rho > 1.0)) return false;
+
+        // 根据计算出的卫星坐标重算信号传播时间
+        const double dt_new = rho / kC;
+        if (std::abs(dt_new - dt) <= 1e-10) {
+            dt = dt_new;
+            break;
+        }
+        dt = dt_new;
+    }
+    return true;
+}
+
+bool ComputeBdsSatStateIterative(const BdsEph& eph, double t_rx_bdt, double pseudorange_m, const Vec3& rx_pos_approx, SatState& state) {
+    // BDS 系统的信号传播时间迭代逻辑，与 GPS 相同
+    if (!(pseudorange_m > 1.0)) return false;
+
+    // 初始设置信号传播时间为 75 ms (0.075 s)
+    double dt = 0.075;
+    SatState st_temp{};
+
+    for (int k = 0; k < 3; ++k) {
+        double t_tx = t_rx_bdt - dt;
+        if (!ComputeBdsSatState(eph, t_tx, 0.0, st_temp)) return false;
+        double t_tx_corr = t_tx - st_temp.clk_s;
+        if (!ComputeBdsSatState(eph, t_tx_corr, dt, state)) return false;
+
+        const double dx = state.pos_ecef.x - rx_pos_approx.x;
+        const double dy = state.pos_ecef.y - rx_pos_approx.y;
+        const double dz = state.pos_ecef.z - rx_pos_approx.z;
+        const double rho = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!(rho > 1.0)) return false;
+
+        const double dt_new = rho / kC;
+        if (std::abs(dt_new - dt) <= 1e-10) {
+            dt = dt_new;
+            break;
+        }
+        dt = dt_new;
+    }
+    return true;
+}
+
 bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s, SatState& state) {
     state = SatState{};
 

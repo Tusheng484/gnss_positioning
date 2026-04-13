@@ -159,7 +159,7 @@ Ephemeris ConvertFromBdsEphem(const BdsEphem& bds_eph) {
     return eph;
 }
 
-SPP::SPP() : max_iter_(10), conv_m_(1e-4), elev_mask_deg_(kDefaultElevMaskDeg), snr_mask_dbhz_(kDefaultSnrMaskDbHz), enable_iono_free_(true), verbose_(false) {
+SPP::SPP() : max_iter_(10), conv_m_(1e-6), elev_mask_deg_(kDefaultElevMaskDeg), snr_mask_dbhz_(kDefaultSnrMaskDbHz), enable_iono_free_(true), verbose_(false) {
     sol_.pos.x = 0.0;
     sol_.pos.y = 0.0;
     sol_.pos.z = 0.0;
@@ -287,20 +287,27 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
             po.wavelength = SppConst::C / ErrorConst::BDS_B1I;
         }
 
-        if (enable_iono_free_ && fo.has1) {
-            const double gf_m = fo.P0 - fo.P1;
-            double dgf_m = 0.0;
-            if (DetectOutlier(fo.sys, fo.prn, gf_m, dgf_m)) {
-                po.gf_m = gf_m;
-                po.dgf_m = dgf_m;
-                po.gf_outlier = true;
-                out.push_back(po);
-                continue;
-            }
-            po.gf_m = gf_m;
-            po.dgf_m = dgf_m;
-            po.gf_outlier = false;
+        double doppler_ms = 0.0;
+        if (po.has_doppler) doppler_ms = -po.doppler * po.wavelength;
 
+        double gf_m = std::numeric_limits<double>::quiet_NaN();
+        if (fo.has1) {
+            gf_m = fo.P0 - fo.P1;
+        }
+
+        double dgf_m = 0.0;
+        if (QualityControlEpoch(fo.sys, fo.prn, fo.P0, doppler_ms, po.has_doppler, gf_m, dgf_m)) {
+            po.gf_m = std::isfinite(gf_m) ? gf_m : 0.0;
+            po.dgf_m = dgf_m;
+            po.gf_outlier = true;
+            out.push_back(po);
+            continue;
+        }
+        po.gf_m = std::isfinite(gf_m) ? gf_m : 0.0;
+        po.dgf_m = dgf_m;
+        po.gf_outlier = false;
+
+        if (enable_iono_free_ && fo.has1) {
             double f1 = 0.0;
             double f2 = 0.0;
             if (fo.sys == GnssSystem::GPS) {
@@ -332,32 +339,41 @@ bool SPP::CheckOBSConsist(double P1, double P2) const {
     return true;
 }
 
-bool SPP::DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m) const {
+bool SPP::QualityControlEpoch(GnssSystem sys, uint32_t prn, double P_m, double doppler_ms, bool has_doppler, double gf_m, double& dgf_m) const {
     dgf_m = 0.0;
-    if (!std::isfinite(gf_m)) return true;
+    bool is_outlier = false;
 
     const uint32_t key = makeKey(sys, prn);
-    auto it = prev_gf_.find(key);
-    if (it == prev_gf_.end()) {
-        prev_gf_[key] = PrevGf{current_tow_gpst_, gf_m};
+    auto it = prev_obs_.find(key);
+    if (it == prev_obs_.end()) {
+        prev_obs_[key] = PrevObsData{current_tow_gpst_, P_m, gf_m};
         return false;
     }
 
     const double dt = normalizeTimeSec(current_tow_gpst_ - it->second.tow_gpst);
-    if (std::abs(dt) > kGfMaxGapSec) {
-        it->second = PrevGf{current_tow_gpst_, gf_m};
+    if (std::abs(dt) > kGfMaxGapSec || std::abs(dt) < 1e-3) {
+        it->second = PrevObsData{current_tow_gpst_, P_m, gf_m};
         return false;
     }
 
-    dgf_m = gf_m - it->second.gf_m;
-    if (!std::isfinite(dgf_m)) return true;
-
-    if (std::abs(dgf_m) > kGfDgfThresholdM) {
-        return true;
+    // GF 历元间跳变检测
+    if (std::isfinite(gf_m) && std::isfinite(it->second.gf_m)) {
+        dgf_m = gf_m - it->second.gf_m;
+        if (std::abs(dgf_m) > kGfDgfThresholdM) {
+            is_outlier = true;
+        }
     }
 
-    it->second = PrevGf{current_tow_gpst_, gf_m};
-    return false;
+    // 多普勒一致性检验
+    if (has_doppler && std::isfinite(P_m) && std::isfinite(it->second.P_m)) {
+        double dP_dt = (P_m - it->second.P_m) / dt;
+        if (std::abs(dP_dt - doppler_ms) > 20.0) {
+            is_outlier = true;
+        }
+    }
+
+    it->second = PrevObsData{current_tow_gpst_, P_m, gf_m};
+    return is_outlier;
 }
 
 double SPP::computeTransmitTime(double t_rx_gpst, double pseudorange_m) const {
@@ -375,41 +391,17 @@ bool SPP::computeSatState(double t_rx_gpst,
                           SatCalc& satCalc) const {
     if (!(pseudorange_m > 1.0)) return false;
 
-    double dt = pseudorange_m / SppConst::C;
-    SatState st{};
     SatState st_corr{};
+    Vec3 rx_pos_vec{rx_pos_approx.x, rx_pos_approx.y, rx_pos_approx.z};
 
-    for (int k = 0; k < 3; ++k) {
-        double t_tx = t_rx_gpst - dt;
-        double t_tx_corr = t_tx;
-
-        if (eph.system == GnssSystem::GPS) {
-            const GpsEph gps_eph = ToGpsEph(eph);
-            if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx), 0.0, st)) return false;
-            t_tx_corr = t_tx - st.clk_s;
-            if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx_corr), dt, st_corr)) return false;
-        } else if (eph.system == GnssSystem::BDS) {
-            const BdsEph bds_eph = ToBdsEph(eph);
-            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx), 0.0, st)) return false;
-            t_tx_corr = t_tx - st.clk_s;
-            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx_corr), dt, st_corr)) return false;
-        } else {
-            return false;
-        }
-
-        const XYZ sat_pos{st_corr.pos_ecef.x, st_corr.pos_ecef.y, st_corr.pos_ecef.z};
-        const double dx = sat_pos.x - rx_pos_approx.x;
-        const double dy = sat_pos.y - rx_pos_approx.y;
-        const double dz = sat_pos.z - rx_pos_approx.z;
-        const double rho = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (!(rho > 1.0)) return false;
-
-        const double dt_new = rho / SppConst::C;
-        if (std::abs(dt_new - dt) <= 1e-10) {
-            dt = dt_new;
-            break;
-        }
-        dt = dt_new;
+    if (eph.system == GnssSystem::GPS) {
+        const GpsEph gps_eph = ToGpsEph(eph);
+        if (!ComputeGpsSatStateIterative(gps_eph, t_rx_gpst, pseudorange_m, rx_pos_vec, st_corr)) return false;
+    } else if (eph.system == GnssSystem::BDS) {
+        const BdsEph bds_eph = ToBdsEph(eph);
+        if (!ComputeBdsSatStateIterative(bds_eph, gpstToBdtSec(t_rx_gpst), pseudorange_m, rx_pos_vec, st_corr)) return false;
+    } else {
+        return false;
     }
 
     satCalc.pos_ecef.x = st_corr.pos_ecef.x;
@@ -617,6 +609,9 @@ bool SPP::solveLeastSquares(const std::vector<SatCalc>& sats,
 
     Eigen::MatrixXd A = H;
     Eigen::VectorXd b = y;
+    // 采用预白化方法：在 H 和 y 的每一行乘上权重的平方根
+    // 这在数学上等价于解正规方程 \hat{x} = (H^T W H)^{-1} H^T W y，
+    // 但直接对 A = W^{1/2} H 进行 QR 分解数值稳定性更好。
     for (int i = 0; i < m; ++i) {
         const double sw = std::sqrt(w(i));
         A.row(i) *= sw;
@@ -631,6 +626,11 @@ bool SPP::solveLeastSquares(const std::vector<SatCalc>& sats,
 }
 
 bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eigen::VectorXd& vel_dx) const {
+    // 基于多普勒（Doppler）观测值建立单点测速观测方程：
+    // D = (V_s - V_r) * \vec{los} / c + dt_dot_s - dt_dot_r
+    // 其中 D 为多普勒观测转换的距离变化率（单位 m/s，且与波长有关）
+    // V_s、V_r 分别为卫星与接收机的速度向量，\vec{los} 为卫星至接收机的单位方向向量
+    // 采用最小二乘非迭代求解，待估参数为测站三维绝对速度和接收机钟速。
     std::vector<const SatCalc*> used;
     used.reserve(sats.size());
     for (const auto& s : sats) {
@@ -678,34 +678,64 @@ bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eig
     return vel_dx.size() == 4 && vel_dx.allFinite();
 }
 
-double SPP::computePDOP(const Eigen::MatrixXd& H) const {
-    if (H.rows() < H.cols()) return 999.0;
+void SPP::computeDOPs(const Eigen::MatrixXd& H, const XYZ& rx_pos) {
+    // 精度评定（DOPs 计算）
+    // 依据协因数阵 Q_{xx} = (H^T H)^{-1} 计算各类精度因子。
+    // （此处 H 为未加权的几何设计矩阵）。
+    // 若使用加权后的阵 H_w = W^{1/2}H，则求得的是误差协方差阵。
+    sol_.gdop = 999.0;
+    sol_.pdop = 999.0;
+    sol_.hdop = 999.0;
+    sol_.vdop = 999.0;
+    sol_.tdop = 999.0;
+
+    if (H.rows() < H.cols()) return;
+    
+    // N = H^T * H
     const Eigen::MatrixXd N = H.transpose() * H;
+    
+    // 使用 LDLT 分解求逆（比直接求逆或 LU 分解更稳定）
     Eigen::LDLT<Eigen::MatrixXd> ldlt(N);
-    if (ldlt.info() != Eigen::Success) return 999.0;
+    if (ldlt.info() != Eigen::Success) return;
+    
     const Eigen::MatrixXd Q = ldlt.solve(Eigen::MatrixXd::Identity(N.rows(), N.cols()));
-    if (!Q.allFinite()) return 999.0;
-    if (!(Q(0, 0) > 0.0 && Q(1, 1) > 0.0 && Q(2, 2) > 0.0)) return 999.0;
-    return std::sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
-}
+    if (!Q.allFinite()) return;
+    if (!(Q(0, 0) > 0.0 && Q(1, 1) > 0.0 && Q(2, 2) > 0.0 && Q(3, 3) > 0.0)) return;
 
-int SPP::detectOutliers(std::vector<SatCalc>& sats, const Eigen::VectorXd& v, double sigma0) const {
-    if (!(sigma0 > 0.0) || !std::isfinite(sigma0)) return 0;
-    const int m = static_cast<int>(sats.size());
-    if (v.size() != m) return 0;
+    // 空间直角坐标系 (XYZ) 下的 PDOP, TDOP, GDOP
+    sol_.pdop = std::sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
+    sol_.tdop = std::sqrt(Q(3, 3));
+    sol_.gdop = std::sqrt(sol_.pdop * sol_.pdop + sol_.tdop * sol_.tdop);
 
-    int rejected = 0;
-    for (int i = 0; i < m; ++i) {
-        const double w = std::abs(v(i)) / sigma0;
-        if (w > 3.0) {
-            if (sats[i].valid) {
-                sats[i].valid = false;
-                rejected++;
-            }
-        }
+    // 空间直角坐标系 (XYZ) 到站心地平坐标系 (ENU) 的协方差转换矩阵
+    BLH blh{};
+    if (XYZToBLH(rx_pos, blh) != 0) return;
+
+    const double sinB = std::sin(blh.latitude);
+    const double cosB = std::cos(blh.latitude);
+    const double sinL = std::sin(blh.longitude);
+    const double cosL = std::cos(blh.longitude);
+
+    // 旋转矩阵 R (XYZ -> ENU)
+    Eigen::Matrix3d R;
+    R << -sinL,          cosL,         0.0,
+         -sinB * cosL,  -sinB * sinL,  cosB,
+          cosB * cosL,   cosB * sinL,  sinB;
+
+    // Q_enu = R * Q_xyz * R^T
+    const Eigen::Matrix3d Q_xyz = Q.block<3, 3>(0, 0);
+    const Eigen::Matrix3d Q_enu = R * Q_xyz * R.transpose();
+
+    // 在 ENU 坐标系下提取 HDOP 和 VDOP
+    if (Q_enu(0, 0) > 0.0 && Q_enu(1, 1) > 0.0) {
+        sol_.hdop = std::sqrt(Q_enu(0, 0) + Q_enu(1, 1));
     }
-    return rejected;
+    if (Q_enu(2, 2) > 0.0) {
+        sol_.vdop = std::sqrt(Q_enu(2, 2));
+    }
 }
+
+
 
 bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const std::vector<Ephemeris>& ephList) {
     // 五步法整体驱动函数：
@@ -717,7 +747,11 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     last_rejected_ = 0;
     last_vel_ok_ = false;
     last_sat_used_.clear();
+    sol_.gdop = 999.0;
     sol_.pdop = 999.0;
+    sol_.hdop = 999.0;
+    sol_.vdop = 999.0;
+    sol_.tdop = 999.0;
     sol_.sigma0 = 0.0;
     sol_.nsat_used = 0;
     sol_.nsat_gps = 0;
@@ -822,10 +856,10 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
                 return false;
             }
 
-            const double dpos2 = dx(0) * dx(0) + dx(1) * dx(1) + dx(2) * dx(2);
+            const double dpos_norm = std::sqrt(dx(0) * dx(0) + dx(1) * dx(1) + dx(2) * dx(2));
             if (verbose_) {
                 std::cout << "  [ITER] " << iter + 1
-                          << " dpos=" << std::sqrt(dpos2)
+                          << " dpos=" << dpos_norm
                           << " clk_gps_m=" << clk_gps_m
                           << " isb_bds_m=" << isb_bds_m
                           << " used=" << sats.size()
@@ -847,7 +881,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
             sigma0_last = 0.0;
             if (dof > 0) sigma0_last = std::sqrt((v.array().square() * w.array()).sum() / static_cast<double>(dof));
 
-            if (dpos2 < 1e-6) {
+            if (dpos_norm < conv_m_) {
                 converged = true;
                 break;
             }
@@ -884,7 +918,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     sol_.clk_gps_m = clk_gps_m;
     sol_.isb_bds_m = isb_bds_m;
     sol_.sigma0 = sigma0_last;
-    sol_.pdop = computePDOP(H_last);
+    computeDOPs(H_last, rx_pos);
 
     int nGpsUsed = 0;
     int nBdsUsed = 0;
@@ -996,6 +1030,10 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
         report.vel = sol_.vel;
         report.clk_drift_ms = sol_.clk_drift_ms;
         report.pdop = sol_.pdop;
+        report.hdop = sol_.hdop;
+        report.vdop = sol_.vdop;
+        report.gdop = sol_.gdop;
+        report.tdop = sol_.tdop;
         report.sigma0 = sol_.sigma0;
         report.nsat_used = sol_.nsat_used;
         report.gs_used = sol_.nsat_gps;

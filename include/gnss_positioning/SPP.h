@@ -77,6 +77,10 @@ struct SppSolution {
     double clk_drift_ms = 0.0;///< 接收机钟差变化率 c*dt_dot_r (m/s)
 
     double pdop = 999.0;      ///< 位置精度因子（PDOP）
+    double hdop = 999.0;      ///< 水平精度因子（HDOP）
+    double vdop = 999.0;      ///< 高程精度因子（VDOP）
+    double gdop = 999.0;      ///< 几何精度因子（GDOP）
+    double tdop = 999.0;      ///< 时间精度因子（TDOP）
     double sigma0 = 0.0;      ///< 单位权中误差 (m)
     int nsat_used = 0;        ///< 参与解算的卫星数
     int nsat_gps = 0;         ///< 参与解算的 GPS 卫星数
@@ -103,7 +107,11 @@ struct SppEpochReport {
 
     XYZ vel = {0.0, 0.0, 0.0}; ///< 测速结果（ECEF，m/s）
     double clk_drift_ms = 0.0; ///< 接收机钟漂 c*dt_dot_r (m/s)
-    double pdop = 999.0;       ///< PDOP
+    double pdop = 999.0;       ///< 位置精度因子 (PDOP)
+    double hdop = 999.0;       ///< 水平精度因子 (HDOP)
+    double vdop = 999.0;       ///< 高程精度因子 (VDOP)
+    double gdop = 999.0;       ///< 几何精度因子 (GDOP)
+    double tdop = 999.0;       ///< 时间精度因子 (TDOP)
     double sigma0 = 0.0;       ///< 单位权中误差 (m)
     int nsat_used = 0;         ///< 参与解算卫星数
     int gs_used = 0;           ///< 参与解算的 GPS 卫星数
@@ -288,14 +296,17 @@ private:
     bool CheckOBSConsist(double P1, double P2) const;
 
     /**
-     * @brief 基于 GF 组合的粗差探测（历元间差分）
+     * @brief 基于历元间差分的质量控制（GF组合探测与多普勒一致性检验）
      * @param sys 卫星系统
      * @param prn 卫星 PRN
+     * @param P_m 当前历元伪距 (m)
+     * @param doppler_ms 当前历元多普勒测速值 (m/s)
+     * @param has_doppler 当前历元多普勒是否有效
      * @param gf_m 当前历元 GF 值 (m)
      * @param dgf_m 输出历元间差分 dGF (m)
      * @return true: 检测为粗差；false: 未检测为粗差
      */
-    bool DetectOutlier(GnssSystem sys, uint32_t prn, double gf_m, double& dgf_m) const;
+    bool QualityControlEpoch(GnssSystem sys, uint32_t prn, double P_m, double doppler_ms, bool has_doppler, double gf_m, double& dgf_m) const;
 
     /**
      * @brief 由接收时刻与伪距计算信号发射时刻近似值
@@ -356,33 +367,30 @@ private:
      * @param sats 有效卫星中间量列表
      * @param rx_pos 接收机坐标（ECEF）
      * @param vel_dx 输出速度解向量 [Vx, Vy, Vz, c*dt_dot_r]^T
-     * @return true: 求解成功；false: 可用卫星不足或数值异常
+     * @return true: 求解成功；false: 可用卫星不足（要求参与解算的卫星数 >= 4 颗）或数值异常
      */
     bool solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eigen::VectorXd& vel_dx) const;
 
     /**
-     * @brief 计算 PDOP 精度因子
+     * @brief 计算各类精度因子（DOPs）
+     * 依据协因数阵 Q_{xx} = (H^T H)^{-1} 计算 GDOP, PDOP, HDOP, VDOP, TDOP。
+     * 包含空间直角坐标系 (XYZ) 到站心地平坐标系 (ENU) 的协方差转换矩阵运算。
      * @param H 定位解算收敛后的设计矩阵（未加权）
-     * @return PDOP，异常时返回 999.0
+     * @param rx_pos 接收机 ECEF 坐标（用于 XYZ 到 ENU 转换）
+     * @return 无，结果存入 sol_
      */
-    double computePDOP(const Eigen::MatrixXd& H) const;
+    void computeDOPs(const Eigen::MatrixXd& H, const XYZ& rx_pos);
 
-    /**
-     * @brief 基于标准化残差的粗差探测与剔除
-     * @param sats 卫星中间量列表（会按 valid 标志剔除）
-     * @param v 后验残差向量（未加权，单位：米）
-     * @param sigma0 单位权中误差 (m)
-     * @return 被剔除的卫星数量
-     */
-    int detectOutliers(std::vector<SatCalc>& sats, const Eigen::VectorXd& v, double sigma0) const;
+
 
 private:
     static constexpr double kDefaultElevMaskDeg = 10.0;
     static constexpr double kDefaultSnrMaskDbHz = 30.0;
     static constexpr double kGfDgfThresholdM = 2.0;
     static constexpr double kGfMaxGapSec = 10.0;
-    static constexpr double kRaimPseudorangeSigmaM = 3.0;
-    static constexpr double kRaimSigmaFactor = 3.0;
+    static constexpr double kRaimPseudorangeSigmaM = 8.0; ///< 伪距残差阈值设为 8 m
+    static constexpr double kRaimPhaseSigmaM = 0.5;       ///< 相位残差阈值设为 0.5 m
+    static constexpr double kRaimSigmaFactor = 1.0;
     static constexpr int kRaimMaxIter = 3;
     static constexpr double kSigmaZenithM = 0.3; ///< 天顶方向伪距噪声 (m)
 
@@ -390,11 +398,12 @@ private:
     int last_rejected_ = 0;
     bool last_vel_ok_ = false;
     mutable double current_tow_gpst_ = 0.0;
-    struct PrevGf {
+    struct PrevObsData {
         double tow_gpst = 0.0;
+        double P_m = 0.0;
         double gf_m = 0.0;
     };
-    mutable std::map<uint32_t, PrevGf> prev_gf_;
+    mutable std::map<uint32_t, PrevObsData> prev_obs_;
     int max_iter_;
     double conv_m_;
     double elev_mask_deg_;

@@ -226,7 +226,7 @@ struct RuntimeConfig {
      * - 需要同一卫星同时存在 freqIdx=0 与 freqIdx=1 的有效伪距观测；
      * - 若缺少第二频点，SPP 内会按策略跳过该卫星（以满足“单频不参与本次解算”的工程约束）。
      */
-    bool enable_iono_free = false;
+    bool enable_iono_free = true;
     bool enable_tropo = true;
     bool enable_klobuchar = true;
     bool enable_tgd = true;
