@@ -30,6 +30,61 @@ bool AllZero4(const double a[4]) {
     return a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0 && a[3] == 0.0;
 }
 
+void NiellMeanCoeffs(double lat_rad_abs, double& ah, double& bh, double& ch, double& aw, double& bw, double& cw) {
+    static constexpr double lat_deg[5] = {15.0, 30.0, 45.0, 60.0, 75.0};
+    static constexpr double ah_t[5] = {1.2769934e-3, 1.2683230e-3, 1.2465397e-3, 1.2196049e-3, 1.2045996e-3};
+    static constexpr double bh_t[5] = {2.9153695e-3, 2.9152299e-3, 2.9288445e-3, 2.9022565e-3, 2.9024912e-3};
+    static constexpr double ch_t[5] = {62.610505e-3, 62.837393e-3, 63.721774e-3, 63.824265e-3, 64.258455e-3};
+    static constexpr double aw_t[5] = {5.8021897e-4, 5.6794847e-4, 5.8118019e-4, 5.9727542e-4, 6.1641693e-4};
+    static constexpr double bw_t[5] = {1.4275268e-3, 1.5138625e-3, 1.4572752e-3, 1.5007428e-3, 1.7599082e-3};
+    static constexpr double cw_t[5] = {4.3472961e-2, 4.6729510e-2, 4.3908931e-2, 4.4626982e-2, 5.4736038e-2};
+
+    double lat_deg_abs = lat_rad_abs * 180.0 / ErrorConst::PI;
+    if (lat_deg_abs <= lat_deg[0]) {
+        ah = ah_t[0];
+        bh = bh_t[0];
+        ch = ch_t[0];
+        aw = aw_t[0];
+        bw = bw_t[0];
+        cw = cw_t[0];
+        return;
+    }
+    if (lat_deg_abs >= lat_deg[4]) {
+        ah = ah_t[4];
+        bh = bh_t[4];
+        ch = ch_t[4];
+        aw = aw_t[4];
+        bw = bw_t[4];
+        cw = cw_t[4];
+        return;
+    }
+
+    int idx = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (lat_deg_abs >= lat_deg[i] && lat_deg_abs < lat_deg[i + 1]) {
+            idx = i;
+            break;
+        }
+    }
+    double t = (lat_deg_abs - lat_deg[idx]) / (lat_deg[idx + 1] - lat_deg[idx]);
+    auto lerp = [t](double a, double b) { return a + (b - a) * t; };
+    ah = lerp(ah_t[idx], ah_t[idx + 1]);
+    bh = lerp(bh_t[idx], bh_t[idx + 1]);
+    ch = lerp(ch_t[idx], ch_t[idx + 1]);
+    aw = lerp(aw_t[idx], aw_t[idx + 1]);
+    bw = lerp(bw_t[idx], bw_t[idx + 1]);
+    cw = lerp(cw_t[idx], cw_t[idx + 1]);
+}
+
+double NiellMapping(double el, double a, double b, double c) {
+    double sin_el = std::sin(el);
+    if (sin_el < 0.1) sin_el = 0.1;
+    double top = 1.0 + a / (1.0 + b / (1.0 + c));
+    double bot = sin_el + a / (sin_el + b / (sin_el + c));
+    if (std::abs(bot) < 1e-6) bot = (bot >= 0.0) ? 1e-6 : -1e-6;
+    return top / bot;
+}
+
 double KlobucharDelayMeters(double tow,
                             const double pos[3],
                             double az,
@@ -146,10 +201,20 @@ double SaastamoinenTropDelay(double lat, double H, double E, double T0, double p
 
     double ZHD = 0.0022768 * p / denom;
     double ZWD = 0.0022768 * (1255.0 / T + 0.05) * e;
-    double ZTD = ZHD + ZWD;
+    double ah = 0.0, bh = 0.0, ch = 0.0;
+    double aw = 0.0, bw = 0.0, cw = 0.0;
+    NiellMeanCoeffs(std::abs(lat), ah, bh, ch, aw, bw, cw);
 
-    double m = 1.0 / std::sin(el);
-    double trop = ZTD * m;
+    double mh = NiellMapping(el, ah, bh, ch);
+    double mw = NiellMapping(el, aw, bw, cw);
+    double H_km = H / 1000.0;
+    if (H_km > -1.0 && H_km < 10.0) {
+        double sin_el = std::sin(el);
+        if (sin_el < 0.1) sin_el = 0.1;
+        mh += (H_km * 0.001) * (1.0 / sin_el - mh);
+    }
+
+    double trop = ZHD * mh + ZWD * mw;
     if (!std::isfinite(trop) || trop < 0.0 || trop > 50.0) return 0.0;
     return trop;
 }

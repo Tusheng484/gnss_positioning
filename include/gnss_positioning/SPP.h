@@ -10,6 +10,7 @@
 
 #include <vector>
 #include <map>
+#include <string>
 #include <Eigen/Dense>
 #include "gnss_positioning/NovatelDecoder.h"
 #include "gnss_positioning/NavMath.h"
@@ -105,6 +106,9 @@ struct SppEpochReport {
     double pdop = 999.0;       ///< PDOP
     double sigma0 = 0.0;       ///< 单位权中误差 (m)
     int nsat_used = 0;         ///< 参与解算卫星数
+    int gs_used = 0;           ///< 参与解算的 GPS 卫星数
+    int bs_used = 0;           ///< 参与解算的 BDS 卫星数
+    std::string sat_used;      ///< 参与解算的卫星编号列表（如：G05 C12），多颗卫星用空格分隔
     int rejected = 0;          ///< 粗差剔除卫星数
     bool vel_ok = false;       ///< 测速是否成功
 };
@@ -199,6 +203,11 @@ public:
      * @return 无
      */
     void setEnableIonoFree(bool enable) { enable_iono_free_ = enable; }
+    void setEnableTroposphere(bool enable) { enable_tropo_ = enable; }
+    void setEnableKlobucharIono(bool enable) { enable_klobuchar_ = enable; }
+    void setEnableTgdCorrection(bool enable) { enable_tgd_ = enable; }
+    void setGpsKlobucharParams(const double alpha[4], const double beta[4]);
+    void setBdsKlobucharParams(const double alpha[4], const double beta[4]);
 
 private:
     /**
@@ -391,6 +400,16 @@ private:
     double elev_mask_deg_;
     double snr_mask_dbhz_;
     bool enable_iono_free_;
+    bool enable_tropo_ = true;
+    bool enable_klobuchar_ = false;
+    bool enable_tgd_ = true;
+    bool has_gps_iono_ = false;
+    bool has_bds_iono_ = false;
+    double gps_alpha_[4] = {0.0, 0.0, 0.0, 0.0};
+    double gps_beta_[4] = {0.0, 0.0, 0.0, 0.0};
+    double bds_alpha_[4] = {0.0, 0.0, 0.0, 0.0};
+    double bds_beta_[4] = {0.0, 0.0, 0.0, 0.0};
+    std::string last_sat_used_;
     bool verbose_;
 };
 

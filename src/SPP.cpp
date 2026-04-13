@@ -14,6 +14,8 @@
 #include <iostream>
 #include <algorithm>
 #include <limits>
+#include <sstream>
+#include <iomanip>
 
 #ifndef M_PI
 // 兼容性处理：部分编译环境未提供 M_PI 宏定义。
@@ -34,6 +36,10 @@ static double normalizeTowSec(double tow) {
 
 static double gpstToBdtSec(double t_gpst) {
     return normalizeTowSec(t_gpst - SppConst::BDT_GPS_OFFSET);
+}
+
+static void copy4(double dst[4], const double src[4]) {
+    for (int i = 0; i < 4; ++i) dst[i] = src[i];
 }
 
 // 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
@@ -159,6 +165,26 @@ SPP::SPP() : max_iter_(10), conv_m_(1e-4), elev_mask_deg_(kDefaultElevMaskDeg), 
     sol_.pos.z = 0.0;
     sol_.clk_gps_m = 0.0;
     sol_.isb_bds_m = 0.0;
+}
+
+void SPP::setGpsKlobucharParams(const double alpha[4], const double beta[4]) {
+    if (!alpha || !beta) {
+        has_gps_iono_ = false;
+        return;
+    }
+    copy4(gps_alpha_, alpha);
+    copy4(gps_beta_, beta);
+    has_gps_iono_ = true;
+}
+
+void SPP::setBdsKlobucharParams(const double alpha[4], const double beta[4]) {
+    if (!alpha || !beta) {
+        has_bds_iono_ = false;
+        return;
+    }
+    copy4(bds_alpha_, alpha);
+    copy4(bds_beta_, beta);
+    has_bds_iono_ = true;
 }
 
 std::vector<double> SPP::getPosition() const {
@@ -361,12 +387,12 @@ bool SPP::computeSatState(double t_rx_gpst,
             const GpsEph gps_eph = ToGpsEph(eph);
             if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx), 0.0, st)) return false;
             t_tx_corr = t_tx - st.clk_s;
-            if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx_corr), 0.0, st_corr)) return false;
+            if (!ComputeGpsSatState(gps_eph, normalizeTowSec(t_tx_corr), dt, st_corr)) return false;
         } else if (eph.system == GnssSystem::BDS) {
             const BdsEph bds_eph = ToBdsEph(eph);
             if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx), 0.0, st)) return false;
             t_tx_corr = t_tx - st.clk_s;
-            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx_corr), 0.0, st_corr)) return false;
+            if (!ComputeBdsSatState(bds_eph, gpstToBdtSec(t_tx_corr), dt, st_corr)) return false;
         } else {
             return false;
         }
@@ -386,26 +412,15 @@ bool SPP::computeSatState(double t_rx_gpst,
         dt = dt_new;
     }
 
-    const double theta = SppConst::OMEGA_E * dt;
-    const double cth = std::cos(theta);
-    const double sth = std::sin(theta);
+    satCalc.pos_ecef.x = st_corr.pos_ecef.x;
+    satCalc.pos_ecef.y = st_corr.pos_ecef.y;
+    satCalc.pos_ecef.z = st_corr.pos_ecef.z;
 
-    const double x = st_corr.pos_ecef.x;
-    const double y = st_corr.pos_ecef.y;
-    const double z = st_corr.pos_ecef.z;
-    satCalc.pos_ecef.x = x * cth + y * sth;
-    satCalc.pos_ecef.y = -x * sth + y * cth;
-    satCalc.pos_ecef.z = z;
-
-    const double vx = st_corr.vel_ecef.x;
-    const double vy = st_corr.vel_ecef.y;
-    const double vz = st_corr.vel_ecef.z;
-    satCalc.vel_ecef.x = vx * cth + vy * sth;
-    satCalc.vel_ecef.y = -vx * sth + vy * cth;
-    satCalc.vel_ecef.z = vz;
+    satCalc.vel_ecef.x = st_corr.vel_ecef.x;
+    satCalc.vel_ecef.y = st_corr.vel_ecef.y;
+    satCalc.vel_ecef.z = st_corr.vel_ecef.z;
 
     satCalc.clk_s = st_corr.clk_s;
-    if (!proc.iono_free) satCalc.clk_s -= eph.tgd;
     satCalc.clk_drift_s = st_corr.clk_drift;
 
     satCalc.has_doppler = proc.has_doppler && (proc.wavelength > 0.0) && std::isfinite(proc.doppler);
@@ -488,15 +503,53 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
 
         double tropo = 0.0;
         if (rx_geo_ok) {
-            tropo = SaastamoinenTropDelay(rx_blh.latitude, rx_blh.height, elev);
+            if (enable_tropo_) {
+                tropo = SaastamoinenTropDelay(rx_blh.latitude, rx_blh.height, elev);
+            }
         }
 
-        double P_corr = o.P + SppConst::C * sc.clk_s;
+        double iono = 0.0;
+        if (rx_geo_ok && enable_klobuchar_ && !o.iono_free) {
+            double pos[3] = {rx_blh.latitude, rx_blh.longitude, rx_blh.height};
+            if (o.system == GnssSystem::GPS && has_gps_iono_) {
+                iono = GPSKlobucharIonoDelay(t_rx_gpst, pos, az, elev, gps_alpha_, gps_beta_);
+            } else if (o.system == GnssSystem::BDS && has_bds_iono_) {
+                iono = BDSKlobucharIonoDelay(gpstToBdtSec(t_rx_gpst), pos, az, elev, bds_alpha_, bds_beta_);
+            }
+        }
+
+        double P_used = o.P;
+        if (enable_tgd_) {
+            double tgd_coeff = 1.0;
+            if (o.iono_free) {
+                double f1 = 0.0;
+                double f2 = 0.0;
+                if (o.system == GnssSystem::GPS) {
+                    f1 = ErrorConst::GPS_L1;
+                    f2 = ErrorConst::GPS_L2;
+                } else if (o.system == GnssSystem::BDS) {
+                    f1 = ErrorConst::BDS_B1I;
+                    f2 = ErrorConst::BDS_B3I;
+                }
+
+                if (f1 > 0.0 && f2 > 0.0) {
+                    const double f1_sq = f1 * f1;
+                    const double f2_sq = f2 * f2;
+                    const double denom = f1_sq - f2_sq;
+                    if (std::abs(denom) > 1e-6) {
+                        tgd_coeff = f1_sq / denom;
+                    }
+                }
+            }
+
+            P_used -= SppConst::C * eph.tgd * tgd_coeff;
+        }
+        double P_corr = P_used + SppConst::C * sc.clk_s;
 
         double bias_m = clk_gps_m;
         if (o.system == GnssSystem::BDS) bias_m += isb_bds_m;
 
-        double resid = P_corr - (rho + tropo + bias_m);
+        double resid = P_corr - (rho + tropo + iono + bias_m);
 
         sc.pos_ecef = sat_pos;
         sc.elev_rad = elev;
@@ -663,6 +716,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     // 5) solveLeastSquares（迭代更新）
     last_rejected_ = 0;
     last_vel_ok_ = false;
+    last_sat_used_.clear();
     sol_.pdop = 999.0;
     sol_.sigma0 = 0.0;
     sol_.nsat_used = 0;
@@ -842,6 +896,18 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     sol_.nsat_gps = nGpsUsed;
     sol_.nsat_bds = nBdsUsed;
 
+    {
+        std::ostringstream oss;
+        for (int i = 0; i < static_cast<int>(sats_last.size()); ++i) {
+            const auto& s = sats_last[i];
+            char sys = 'G';
+            if (s.system == GnssSystem::BDS) sys = 'C';
+            oss << sys << std::setw(2) << std::setfill('0') << s.prn;
+            if (i + 1 < static_cast<int>(sats_last.size())) oss << " ";
+        }
+        last_sat_used_ = oss.str();
+    }
+
     Eigen::VectorXd vel_dx;
     if (solveVelocity(sats_last, sol_.pos, vel_dx)) {
         sol_.vel = {vel_dx(0), vel_dx(1), vel_dx(2)};
@@ -932,6 +998,9 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
         report.pdop = sol_.pdop;
         report.sigma0 = sol_.sigma0;
         report.nsat_used = sol_.nsat_used;
+        report.gs_used = sol_.nsat_gps;
+        report.bs_used = sol_.nsat_bds;
+        report.sat_used = last_sat_used_;
         report.rejected = last_rejected_;
         report.vel_ok = last_vel_ok_;
         return true;

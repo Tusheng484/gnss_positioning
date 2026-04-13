@@ -288,8 +288,6 @@ bool ComputeClock(double t,
 bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s, SatState& state) {
     state = SatState{};
 
-    (void)transit_time_s;
-
     double tk = NormalizeWeekCrossover(t_gpst - eph.toe);
     state.eph_expired = (std::abs(tk) > kGpsEphValidSec);
 
@@ -310,6 +308,22 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
     double Omega_dot = eph.OmegaDot - kOmegaEGps;
     ComputeEcefFromOrbitalPlane(orb, Omega, Omega_dot, state.pos_ecef, state.vel_ecef);
 
+    if (IsFinite(transit_time_s) && transit_time_s != 0.0) {
+        double alpha = kOmegaEGps * transit_time_s;
+        double ca = std::cos(alpha);
+        double sa = std::sin(alpha);
+
+        double x = state.pos_ecef.x;
+        double y = state.pos_ecef.y;
+        state.pos_ecef.x = x * ca + y * sa;
+        state.pos_ecef.y = -x * sa + y * ca;
+
+        double vx = state.vel_ecef.x;
+        double vy = state.vel_ecef.y;
+        state.vel_ecef.x = vx * ca + vy * sa;
+        state.vel_ecef.y = -vx * sa + vy * ca;
+    }
+
     state.valid = IsFinite(state.pos_ecef.x) && IsFinite(state.pos_ecef.y) && IsFinite(state.pos_ecef.z) &&
                   IsFinite(state.vel_ecef.x) && IsFinite(state.vel_ecef.y) && IsFinite(state.vel_ecef.z) &&
                   IsFinite(state.clk_s) && IsFinite(state.clk_drift);
@@ -318,7 +332,6 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
 
 bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, SatState& state) {
     state = SatState{};
-    (void)transit_time_s;
 
     // 直接使用原生的 BDT 时间计算，切勿加 14 秒！
     double tk = NormalizeWeekCrossover(t_bdt - eph.toe);
@@ -360,6 +373,22 @@ bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, 
         state.vel_ecef.x += rot_term.x;
         state.vel_ecef.y += rot_term.y;
         state.vel_ecef.z += rot_term.z;
+    }
+
+    if (IsFinite(transit_time_s) && transit_time_s != 0.0) {
+        double alpha = kOmegaEBds * transit_time_s;
+        double ca = std::cos(alpha);
+        double sa = std::sin(alpha);
+
+        double x = state.pos_ecef.x;
+        double y = state.pos_ecef.y;
+        state.pos_ecef.x = x * ca + y * sa;
+        state.pos_ecef.y = -x * sa + y * ca;
+
+        double vx = state.vel_ecef.x;
+        double vy = state.vel_ecef.y;
+        state.vel_ecef.x = vx * ca + vy * sa;
+        state.vel_ecef.y = -vx * sa + vy * ca;
     }
 
     state.valid = IsFinite(state.pos_ecef.x) && IsFinite(state.pos_ecef.y) && IsFinite(state.pos_ecef.z) &&

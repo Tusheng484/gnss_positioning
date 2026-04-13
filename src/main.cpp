@@ -60,6 +60,36 @@ double GpstToBdtSec(double t_gpst) {
 }
 
 /**
+ * @brief 将 GPST 时间格式化为标准“年月日时分秒”字符串
+ * @param gps_time GPS 时间（周+周内秒）
+ * @param out_date 输出日期字符串，格式：YYYY-MM-DD
+ * @param out_time 输出时间字符串，格式：HH:MM:SS
+ * @return true: 转换成功；false: 转换失败
+ */
+bool FormatGpsTimeYmdHms(const gnss::GPSTIME& gps_time, std::string& out_date, std::string& out_time) {
+    gnss::COMMONTIME ct{};
+    if (gnss::GpsTimeToCommonTime(gps_time, ct) != 0) return false;
+
+    std::ostringstream oss_date;
+    oss_date << std::setw(4) << std::setfill('0') << ct.Year << "-"
+             << std::setw(2) << std::setfill('0') << ct.Month << "-"
+             << std::setw(2) << std::setfill('0') << ct.Day;
+
+    int sec_i = static_cast<int>(ct.Second);
+    if (sec_i < 0) sec_i = 0;
+    if (sec_i > 59) sec_i = 59;
+
+    std::ostringstream oss_time;
+    oss_time << std::setw(2) << std::setfill('0') << ct.Hour << ":"
+             << std::setw(2) << std::setfill('0') << ct.Minute << ":"
+             << std::setw(2) << std::setfill('0') << sec_i;
+
+    out_date = oss_date.str();
+    out_time = oss_time.str();
+    return true;
+}
+
+/**
  * @brief 运行时配置项（由命令行与配置文件驱动）
  *
  * 设计目的：
@@ -196,7 +226,14 @@ struct RuntimeConfig {
      * - 需要同一卫星同时存在 freqIdx=0 与 freqIdx=1 的有效伪距观测；
      * - 若缺少第二频点，SPP 内会按策略跳过该卫星（以满足“单频不参与本次解算”的工程约束）。
      */
-    bool enable_iono_free = true;
+    bool enable_iono_free = false;
+    bool enable_tropo = true;
+    bool enable_klobuchar = true;
+    bool enable_tgd = true;
+
+    double ref_ecef_x = -2267804.5260;
+    double ref_ecef_y = 5009342.3720;
+    double ref_ecef_z = 3220991.8630;
 
     /**
      * @brief 启用落盘（便捷开关）
@@ -294,7 +331,17 @@ public:
             else if (arg.rfind("--snr-mask=", 0) == 0) cfg_.snr_mask_dbhz = std::stod(arg.substr(11));
             else if (arg == "--iono-free") cfg_.enable_iono_free = true;
             else if (arg == "--no-iono-free") cfg_.enable_iono_free = false;
+            else if (arg == "--tropo") cfg_.enable_tropo = true;
+            else if (arg == "--no-tropo") cfg_.enable_tropo = false;
+            else if (arg == "--klobuchar") cfg_.enable_klobuchar = true;
+            else if (arg == "--no-klobuchar") cfg_.enable_klobuchar = false;
+            else if (arg == "--tgd") cfg_.enable_tgd = true;
+            else if (arg == "--no-tgd") cfg_.enable_tgd = false;
+            else if (arg.rfind("--ref-x=", 0) == 0) cfg_.ref_ecef_x = std::stod(arg.substr(8));
+            else if (arg.rfind("--ref-y=", 0) == 0) cfg_.ref_ecef_y = std::stod(arg.substr(8));
+            else if (arg.rfind("--ref-z=", 0) == 0) cfg_.ref_ecef_z = std::stod(arg.substr(8));
         }
+
 
         if (!cfg_.config_path.empty()) {
             loadFromFile(cfg_.config_path);
@@ -355,6 +402,12 @@ private:
             else if (key == "elev_mask_deg") cfg_.elev_mask_deg = std::stod(val);
             else if (key == "snr_mask_dbhz") cfg_.snr_mask_dbhz = std::stod(val);
             else if (key == "enable_iono_free") cfg_.enable_iono_free = (val == "1" || val == "true");
+            else if (key == "enable_tropo") cfg_.enable_tropo = (val == "1" || val == "true");
+            else if (key == "enable_klobuchar") cfg_.enable_klobuchar = (val == "1" || val == "true");
+            else if (key == "enable_tgd") cfg_.enable_tgd = (val == "1" || val == "true");
+            else if (key == "ref_ecef_x") cfg_.ref_ecef_x = std::stod(val);
+            else if (key == "ref_ecef_y") cfg_.ref_ecef_y = std::stod(val);
+            else if (key == "ref_ecef_z") cfg_.ref_ecef_z = std::stod(val);
         }
         return true;
     }
@@ -418,14 +471,23 @@ public:
 
     /**
      * @brief 输出单历元摘要（用于观察解算是否稳定、卫星匹配是否满足）
+     * @param gps_time 当前历元 GPS 时间（用于格式化输出年月日时分秒）
      * @param report SPP 输出的历元报告
      * @param ok 解算结果标志（true: 成功；false: 失败）
      * @return 无
      */
-    void printEpoch(const gnss::SppEpochReport& report, bool ok) {
+    void printEpoch(const gnss::GPSTIME& gps_time, const gnss::SppEpochReport& report, bool ok) {
         if (!enabled_) return;
         if (!report.attempted) return;
-        std::cout << "TOW=" << std::fixed << std::setprecision(3) << report.tow_gpst
+        std::string date;
+        std::string time;
+        if (!FormatGpsTimeYmdHms(gps_time, date, time)) {
+            date = "0000-00-00";
+            time = "00:00:00";
+        }
+
+        std::cout << "TIME=" << date << " " << time
+                  << " TOW=" << std::fixed << std::setprecision(3) << report.tow_gpst
                   << " OK=" << (ok ? 1 : 0)
                   << " OBS(G/B)=" << report.obs_g << "/" << report.obs_b
                   << " MATCH(G/B)=" << report.match_g << "/" << report.match_b
@@ -518,8 +580,7 @@ public:
             spp_file_.open(spp_path_);
             if (!spp_file_.is_open()) return false;
             spp_file_.setf(std::ios::fixed, std::ios::floatfield);
-            spp_file_ << std::setprecision(3);
-            spp_file_ << "TOW OBS_G OBS_B EPH_G EPH_B MATCH_G MATCH_B ATTEMPT OK X(m) Y(m) Z(m) CLK_GPS(m) ISB_BDS(m) PDOP VEL_X(m/s) VEL_Y(m/s) VEL_Z(m/s) CLK_DRIFT_MS(ms)" << std::endl;
+            spp_file_ << "Wk SOW ECEF-X/m ECEF-Y/m ECEF-Z/m REF-ECEF-X/m REF-ECEF-Y/m REF-ECEF-Z/m EAST/m NORTH/m UP/m B/deg L/deg H/m VX/m VY/m VZ/m PDOP SigmaP SigmaV GS BS n" << std::endl;
         }
 
         if (cfg_.file_sat_states) {
@@ -569,6 +630,7 @@ public:
 
     /**
      * @brief 写入单历元 SPP 报告（spp_solution.txt）
+     * @param gps_time 当前历元 GPS 时间（用于格式化输出年月日时分秒）
      * @param report SPP 历元报告
      * @return 无
      *
@@ -576,19 +638,59 @@ public:
      * - report.attempted / report.ok 等字段由 SPP 模块负责填充；
      * - 此处仅按表头顺序输出，便于后处理脚本解析。
      */
-    void writeSppReport(const gnss::SppEpochReport& report) {
+    void writeSppReport(const gnss::GPSTIME& gps_time, const gnss::SppEpochReport& report) {
         if (!cfg_.file_output || !cfg_.file_spp_solution) return;
         if (!spp_file_.is_open()) return;
-        spp_file_ << report.tow_gpst << " "
-                  << report.obs_g << " " << report.obs_b << " "
-                  << report.eph_g << " " << report.eph_b << " "
-                  << report.match_g << " " << report.match_b << " "
-                  << (report.attempted ? 1 : 0) << " "
-                  << (report.ok ? 1 : 0) << " "
-                  << report.pos.x << " " << report.pos.y << " " << report.pos.z << " "
-                  << report.clk_gps_m << " " << report.isb_bds_m << " " << report.pdop << " "
-                  << report.vel.x << " " << report.vel.y << " "<< report.vel.z<<" "
-                  << report.clk_drift_ms<<" "
+        if (!has_ref_ && (cfg_.ref_ecef_x != 0.0 || cfg_.ref_ecef_y != 0.0 || cfg_.ref_ecef_z != 0.0)) {
+            ref_xyz_.x = cfg_.ref_ecef_x;
+            ref_xyz_.y = cfg_.ref_ecef_y;
+            ref_xyz_.z = cfg_.ref_ecef_z;
+            has_ref_ = true;
+        }
+        if (!has_ref_ && report.ok) {
+            ref_xyz_ = report.pos;
+            has_ref_ = true;
+        }
+
+        double east = 0.0, north = 0.0, up = 0.0;
+        if (has_ref_) {
+            (void)gnss::XyzToEnu(ref_xyz_, report.pos, east, north, up);
+        }
+
+        gnss::BLH blh{};
+        double b_deg = 0.0, l_deg = 0.0, h_m = 0.0;
+        if (gnss::XYZToBLH(report.pos, blh) == 0) {
+            b_deg = blh.latitude * 180.0 / M_PI;
+            l_deg = blh.longitude * 180.0 / M_PI;
+            h_m = blh.height;
+        }
+
+        const double sigma_p = report.sigma0 * report.pdop;
+        const double sigma_v = 0.0;
+
+        spp_file_ << std::setw(4) << gps_time.Week << " "
+                  << std::setw(11) << std::fixed << std::setprecision(3) << gps_time.SecOfWeek << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << report.pos.x << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << report.pos.y << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << report.pos.z << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << (has_ref_ ? ref_xyz_.x : 0.0) << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << (has_ref_ ? ref_xyz_.y : 0.0) << " "
+                  << std::setw(14) << std::fixed << std::setprecision(4) << (has_ref_ ? ref_xyz_.z : 0.0) << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << east << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << north << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << up << " "
+                  << std::setw(13) << std::fixed << std::setprecision(9) << b_deg << " "
+                  << std::setw(13) << std::fixed << std::setprecision(9) << l_deg << " "
+                  << std::setw(11) << std::fixed << std::setprecision(4) << h_m << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << report.vel.x << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << report.vel.y << " "
+                  << std::setw(10) << std::fixed << std::setprecision(4) << report.vel.z << " "
+                  << std::setw(6) << std::fixed << std::setprecision(3) << report.pdop << " "
+                  << std::setw(7) << std::fixed << std::setprecision(3) << sigma_p << " "
+                  << std::setw(7) << std::fixed << std::setprecision(3) << sigma_v << " "
+                  << std::setw(2) << report.gs_used << " "
+                  << std::setw(2) << report.bs_used << " "
+                  << report.sat_used
                   << std::endl;
     }
 
@@ -746,6 +848,8 @@ private:
      * @brief 运行时配置引用（由 main() 生命周期托管）
      */
     const RuntimeConfig& cfg_;
+    bool has_ref_ = false;
+    gnss::XYZ ref_xyz_ = {0.0, 0.0, 0.0};
 
     std::ofstream spp_file_;
     std::ofstream sat_file_;
@@ -777,6 +881,9 @@ public:
         solver_.setElevationMaskDeg(cfg.elev_mask_deg);
         solver_.setSnrMaskDbHz(cfg.snr_mask_dbhz);
         solver_.setEnableIonoFree(cfg.enable_iono_free);
+        solver_.setEnableTroposphere(cfg.enable_tropo);
+        solver_.setEnableKlobucharIono(cfg.enable_klobuchar);
+        solver_.setEnableTgdCorrection(cfg.enable_tgd);
         solver_.setVerbose(false);
     }
 
@@ -1061,7 +1168,7 @@ int main(int argc, char** argv) {
             // 单历元 SPP 解算：输出 report（用于终端摘要与落盘）。
             gnss::SppEpochReport report;
             bool ok = spp.compute(tow, obs_list, eph_list, report);
-            term.printEpoch(report, ok);
+            term.printEpoch(gps_time, report, ok);
 
             // 统计与落盘：attempted 表示满足基本条件并进入解算流程。
             if (report.attempted) solve_attempt++;
@@ -1070,7 +1177,7 @@ int main(int argc, char** argv) {
             if (!report.attempted && (report.eph_g + report.eph_b) == 0) skip_no_eph++;
             if (!report.attempted && (report.eph_g + report.eph_b) > 0) skip_low_match++;
 
-            files.writeSppReport(report);
+            files.writeSppReport(gps_time, report);
 
             // 记录首个成功历元与最近成功历元（用于终端快速定位结果范围）。
             if (ok) {
