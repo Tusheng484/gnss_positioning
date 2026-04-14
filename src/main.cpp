@@ -140,7 +140,7 @@ struct RuntimeConfig {
      * - 不影响文件落盘；
      * - 不影响算法执行，仅控制 std::cout 输出。
      */
-    bool terminal_output = false;
+    bool terminal_output = true;
 
     //=== FILE OUTPUT CONFIGURATION =========================================//
     /**
@@ -167,7 +167,7 @@ struct RuntimeConfig {
      * - enable_sat_state 为 true；
      * - 仅对每历元 freqIdx==0 的卫星输出一条状态记录。
      */
-    bool file_sat_states = true;
+    bool file_sat_states = false;
     /**
      * @brief 星历落盘开关（gps_ephem.txt / bds_ephem.txt）
      *
@@ -175,7 +175,7 @@ struct RuntimeConfig {
      * - file_output 为 true；
      * - 仅当输入流中出现对应星历消息（ID=7/1696）时写入。
      */
-    bool file_ephemeris = true;
+    bool file_ephemeris = false;
     /**
      * @brief 原始观测落盘开关（range_obs.txt）
      *
@@ -183,7 +183,7 @@ struct RuntimeConfig {
      * - file_output 为 true；
      * - 仅当输入流中出现 RANGE 消息（ID=43）时写入。
      */
-    bool file_observations = true;
+    bool file_observations = false;
 
     //=== ALGORITHM CONFIGURATION ===========================================//
     /**
@@ -666,7 +666,7 @@ public:
         }
 
         const double sigma_p = report.sigma0 * report.pdop;
-        const double sigma_v = 0.0;
+        const double sigma_v = report.sigma_v;
 
         spp_file_ << std::setw(4) << gps_time.Week << " "
                   << std::setw(11) << std::fixed << std::setprecision(3) << gps_time.SecOfWeek << " "

@@ -649,7 +649,12 @@ bool SPP::solveLeastSquares(const std::vector<SatCalc>& sats,
     return v.allFinite();
 }
 
-bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eigen::VectorXd& vel_dx) const {
+bool SPP::solveVelocity(const std::vector<SatCalc>& sats,
+                        const XYZ& rx_pos,
+                        Eigen::VectorXd& vel_dx,
+                        Eigen::VectorXd& v,
+                        Eigen::MatrixXd& H,
+                        double& sigma_v) const {
     // 基于多普勒（Doppler）观测值建立单点测速观测方程：
     // D = (V_s - V_r) * \vec{los} / c + dt_dot_s - dt_dot_r
     // 其中 D 为多普勒观测转换的距离变化率（单位 m/s，且与波长有关）
@@ -657,6 +662,7 @@ bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eig
     // 采用最小二乘非迭代求解，待估参数为测站三维绝对速度和接收机钟速。
     std::vector<const SatCalc*> used;
     used.reserve(sats.size());
+    sigma_v = 0.0;
     for (const auto& s : sats) {
         if (!s.valid) continue;
         if (!s.has_doppler) continue;
@@ -666,7 +672,7 @@ bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eig
     if (static_cast<int>(used.size()) < 4) return false;
 
     const int m = static_cast<int>(used.size());
-    Eigen::MatrixXd H(m, 4);
+    H.resize(m, 4);
     Eigen::VectorXd y(m);
     Eigen::VectorXd w(m);
 
@@ -699,7 +705,26 @@ bool SPP::solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eig
     }
 
     vel_dx = A.colPivHouseholderQr().solve(b);
-    return vel_dx.size() == 4 && vel_dx.allFinite();
+    if (!(vel_dx.size() == 4 && vel_dx.allFinite())) return false;
+
+    v = y - H * vel_dx;
+    if (!(v.size() == m && v.allFinite())) return false;
+
+    const int dof = m - static_cast<int>(H.cols());
+    if (dof <= 0) return true;
+
+    const double sigma_v0 = std::sqrt((v.array().square() * w.array()).sum() / static_cast<double>(dof));
+    const Eigen::MatrixXd N = H.transpose() * H;
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(N);
+    if (ldlt.info() != Eigen::Success) return true;
+
+    const Eigen::MatrixXd Q = ldlt.solve(Eigen::MatrixXd::Identity(N.rows(), N.cols()));
+    if (!Q.allFinite()) return true;
+    if (!(Q(0, 0) > 0.0 && Q(1, 1) > 0.0 && Q(2, 2) > 0.0)) return true;
+
+    const double vdop_vel = std::sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
+    sigma_v = sigma_v0 * vdop_vel;
+    return true;
 }
 
 void SPP::computeDOPs(const Eigen::MatrixXd& H, const XYZ& rx_pos) {
@@ -777,6 +802,7 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     sol_.vdop = 999.0;
     sol_.tdop = 999.0;
     sol_.sigma0 = 0.0;
+    sol_.sigma_v = 0.0;
     sol_.nsat_used = 0;
     sol_.nsat_gps = 0;
     sol_.nsat_bds = 0;
@@ -967,9 +993,13 @@ bool SPP::compute(double t_rx_gpst, const std::vector<ObsData>& obsList, const s
     }
 
     Eigen::VectorXd vel_dx;
-    if (solveVelocity(sats_last, sol_.pos, vel_dx)) {
+    Eigen::VectorXd vel_v;
+    Eigen::MatrixXd vel_H;
+    double sigma_v = 0.0;
+    if (solveVelocity(sats_last, sol_.pos, vel_dx, vel_v, vel_H, sigma_v)) {
         sol_.vel = {vel_dx(0), vel_dx(1), vel_dx(2)};
         sol_.clk_drift_ms = vel_dx(3);
+        sol_.sigma_v = sigma_v;
         last_vel_ok_ = true;
     }
 
@@ -1059,6 +1089,7 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
         report.gdop = sol_.gdop;
         report.tdop = sol_.tdop;
         report.sigma0 = sol_.sigma0;
+        report.sigma_v = sol_.sigma_v;
         report.nsat_used = sol_.nsat_used;
         report.gs_used = sol_.nsat_gps;
         report.bs_used = sol_.nsat_bds;

@@ -82,6 +82,7 @@ struct SppSolution {
     double gdop = 999.0;      ///< 几何精度因子（GDOP）
     double tdop = 999.0;      ///< 时间精度因子（TDOP）
     double sigma0 = 0.0;      ///< 单位权中误差 (m)
+    double sigma_v = 0.0;     ///< 三维测速精度指标 (m/s)
     int nsat_used = 0;        ///< 参与解算的卫星数
     int nsat_gps = 0;         ///< 参与解算的 GPS 卫星数
     int nsat_bds = 0;         ///< 参与解算的 BDS 卫星数
@@ -113,6 +114,7 @@ struct SppEpochReport {
     double gdop = 999.0;       ///< 几何精度因子 (GDOP)
     double tdop = 999.0;       ///< 时间精度因子 (TDOP)
     double sigma0 = 0.0;       ///< 单位权中误差 (m)
+    double sigma_v = 0.0;      ///< 三维测速精度指标 (m/s)
     int nsat_used = 0;         ///< 参与解算卫星数
     int gs_used = 0;           ///< 参与解算的 GPS 卫星数
     int bs_used = 0;           ///< 参与解算的 BDS 卫星数
@@ -367,9 +369,17 @@ private:
      * @param sats 有效卫星中间量列表
      * @param rx_pos 接收机坐标（ECEF）
      * @param vel_dx 输出速度解向量 [Vx, Vy, Vz, c*dt_dot_r]^T
+     * @param v 输出后验残差向量（未加权，单位 m/s）
+     * @param H 输出设计矩阵（未加权）
+     * @param sigma_v 输出三维测速精度指标（m/s）
      * @return true: 求解成功；false: 可用卫星不足（要求参与解算的卫星数 >= 4 颗）或数值异常
      */
-    bool solveVelocity(const std::vector<SatCalc>& sats, const XYZ& rx_pos, Eigen::VectorXd& vel_dx) const;
+    bool solveVelocity(const std::vector<SatCalc>& sats,
+                       const XYZ& rx_pos,
+                       Eigen::VectorXd& vel_dx,
+                       Eigen::VectorXd& v,
+                       Eigen::MatrixXd& H,
+                       double& sigma_v) const;
 
     /**
      * @brief 计算各类精度因子（DOPs）
