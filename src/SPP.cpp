@@ -42,6 +42,43 @@ static void copy4(double dst[4], const double src[4]) {
     for (int i = 0; i < 4; ++i) dst[i] = src[i];
 }
 
+static XYZ rotateClockwiseAroundZ(const XYZ& v, double angle_rad) {
+    const double ca = std::cos(angle_rad);
+    const double sa = std::sin(angle_rad);
+    XYZ out;
+    out.x = v.x * ca + v.y * sa;
+    out.y = -v.x * sa + v.y * ca;
+    out.z = v.z;
+    return out;
+}
+
+static double computeTgdCorrectionMeters(GnssSystem system, bool iono_free, double tgd_s) {
+    if (!std::isfinite(tgd_s) || tgd_s == 0.0) return 0.0;
+
+    if (system == GnssSystem::GPS) {
+        // GPS 广播钟差参考到 IF 组合。当前单频主观测为 L1，因此仅单频 L1 需要扣除 1*TGD。
+        return iono_free ? 0.0 : (SppConst::C * tgd_s);
+    }
+
+    if (system == GnssSystem::BDS) {
+        if (!iono_free) {
+            // 当前单频主观测为 B1I，TGD1 直接以 B1I 偏置形式改正。
+            return SppConst::C * tgd_s;
+        }
+
+        // BDS 广播钟差通常参考 B3I。对于 B1I/B3I IF 组合，仅 B1I 分量含 TGD1，
+        // 因此需要按 IF 组合中 B1I 的系数加权扣除。
+        const double f1_2 = SppConst::BDS_B1I * SppConst::BDS_B1I;
+        const double f3_2 = SppConst::BDS_B3I * SppConst::BDS_B3I;
+        const double denom = f1_2 - f3_2;
+        if (std::abs(denom) <= std::numeric_limits<double>::epsilon()) return 0.0;
+        const double coeff_b1 = f1_2 / denom;
+        return SppConst::C * coeff_b1 * tgd_s;
+    }
+
+    return 0.0;
+}
+
 // 将 SPP 统一星历结构体映射为卫星状态计算模块的输入格式。
 // 该映射仅做字段搬运，不引入任何单位换算，以保持前后计算口径一致。
 static GpsEph ToGpsEph(const Ephemeris& eph) {
@@ -465,7 +502,16 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         const auto& eph = it->second;
 
         if (!computeSatState(t_rx_gpst, o.P, eph, rx_pos, o, sc)) continue;
-        const XYZ sat_pos = sc.pos_ecef;
+        const XYZ sat_pos_tx = sc.pos_ecef;
+        const XYZ sat_vel_tx = sc.vel_ecef;
+
+        // Sagnac 改正必须在观测方程层显式完成：先用伪距估计传播时间，
+        // 再将卫星发射时刻的 ECEF 坐标顺时针旋转到接收时刻的 ECEF 坐标框架。
+        const double tau = o.P / SppConst::C;
+        if (!(tau > 0.0) || !std::isfinite(tau)) continue;
+        const double sagnac_angle = SppConst::OMEGA_E * tau;
+        const XYZ sat_pos = rotateClockwiseAroundZ(sat_pos_tx, sagnac_angle);
+        const XYZ sat_vel = rotateClockwiseAroundZ(sat_vel_tx, sagnac_angle);
 
         double dx = sat_pos.x - rx_pos.x;
         double dy = sat_pos.y - rx_pos.y;
@@ -511,39 +557,17 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         }
 
         double P_used = o.P;
-        if (enable_tgd_) {
-            double tgd_coeff = 1.0;
-            if (o.iono_free) {
-                double f1 = 0.0;
-                double f2 = 0.0;
-                if (o.system == GnssSystem::GPS) {
-                    f1 = ErrorConst::GPS_L1;
-                    f2 = ErrorConst::GPS_L2;
-                } else if (o.system == GnssSystem::BDS) {
-                    f1 = ErrorConst::BDS_B1I;
-                    f2 = ErrorConst::BDS_B3I;
-                }
+        if (enable_tgd_) P_used -= computeTgdCorrectionMeters(o.system, o.iono_free, eph.tgd);
 
-                if (f1 > 0.0 && f2 > 0.0) {
-                    const double f1_sq = f1 * f1;
-                    const double f2_sq = f2 * f2;
-                    const double denom = f1_sq - f2_sq;
-                    if (std::abs(denom) > 1e-6) {
-                        tgd_coeff = f1_sq / denom;
-                    }
-                }
-            }
-
-            P_used -= SppConst::C * eph.tgd * tgd_coeff;
-        }
         double P_corr = P_used + SppConst::C * sc.clk_s;
-
+        
         double bias_m = clk_gps_m;
         if (o.system == GnssSystem::BDS) bias_m += isb_bds_m;
 
         double resid = P_corr - (rho + tropo + iono + bias_m);
 
         sc.pos_ecef = sat_pos;
+        sc.vel_ecef = sat_vel;
         sc.elev_rad = elev;
         sc.az_rad = az;
         sc.los = los;

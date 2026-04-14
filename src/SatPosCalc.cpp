@@ -26,7 +26,7 @@ constexpr double kOmegaEGps = 7.2921151467e-5;
 
 // BDS（CGCS2000）轨道动力学常量。
 constexpr double kMuBds = 3.986004418e14;
-constexpr double kOmegaEBds = 7.2921150e-5;
+constexpr double kOmegaEBds = 7.2921151467e-5;
 
 // 相对论改正：Δtr = F * e * sqrt(A) * sin(E)。
 constexpr double kRelF = -4.442807633e-10;
@@ -243,7 +243,6 @@ bool ComputeClock(double t,
                   double af0,
                   double af1,
                   double af2,
-                  double tgd,
                   double sqrtA,
                   double ecc,
                   double dN,
@@ -251,9 +250,10 @@ bool ComputeClock(double t,
                   double& clk_s,
                   double& clk_drift) {
     // 卫星钟差与钟速（广播星历模型）：
-    // clk = af0 + af1*dt + af2*dt^2 + Δtr - TGD
+    // clk = af0 + af1*dt + af2*dt^2 + Δtr
     // clk_dot = af1 + 2*af2*dt + Δṫr
-    // TGD 用于单频等效改正；多频情况下应按频点进行设备延迟建模。
+    // TGD 属于观测频点相关硬件偏差，应在观测方程层按观测模式统一处理，
+    // 不能混入底层钟差/钟速，否则会破坏 IF 与单频模式的一致性。
     double dt = NormalizeWeekCrossover(t - toc);
     if (std::abs(dt) > kHalfWeekSec) return false;
 
@@ -359,11 +359,12 @@ bool ComputeBdsSatStateIterative(const BdsEph& eph, double t_rx_bdt, double pseu
 
 bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s, SatState& state) {
     state = SatState{};
+    (void)transit_time_s;
 
     double tk = NormalizeWeekCrossover(t_gpst - eph.toe);
     state.eph_expired = (std::abs(tk) > kGpsEphValidSec);
 
-    if (!ComputeClock(t_gpst, eph.toc, eph.toe, kMuGps, eph.af0, eph.af1, eph.af2, eph.tgd, eph.sqrtA, eph.e, eph.deltaN,
+    if (!ComputeClock(t_gpst, eph.toc, eph.toe, kMuGps, eph.af0, eph.af1, eph.af2, eph.sqrtA, eph.e, eph.deltaN,
                       eph.M0, state.clk_s, state.clk_drift)) {
         return false;
     }
@@ -380,22 +381,6 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
     double Omega_dot = eph.OmegaDot - kOmegaEGps;
     ComputeEcefFromOrbitalPlane(orb, Omega, Omega_dot, state.pos_ecef, state.vel_ecef);
 
-    if (IsFinite(transit_time_s) && transit_time_s != 0.0) {
-        double alpha = kOmegaEGps * transit_time_s;
-        double ca = std::cos(alpha);
-        double sa = std::sin(alpha);
-
-        double x = state.pos_ecef.x;
-        double y = state.pos_ecef.y;
-        state.pos_ecef.x = x * ca + y * sa;
-        state.pos_ecef.y = -x * sa + y * ca;
-
-        double vx = state.vel_ecef.x;
-        double vy = state.vel_ecef.y;
-        state.vel_ecef.x = vx * ca + vy * sa;
-        state.vel_ecef.y = -vx * sa + vy * ca;
-    }
-
     state.valid = IsFinite(state.pos_ecef.x) && IsFinite(state.pos_ecef.y) && IsFinite(state.pos_ecef.z) &&
                   IsFinite(state.vel_ecef.x) && IsFinite(state.vel_ecef.y) && IsFinite(state.vel_ecef.z) &&
                   IsFinite(state.clk_s) && IsFinite(state.clk_drift);
@@ -404,12 +389,13 @@ bool ComputeGpsSatState(const GpsEph& eph, double t_gpst, double transit_time_s,
 
 bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, SatState& state) {
     state = SatState{};
+    (void)transit_time_s;
 
     // 直接使用原生的 BDT 时间计算，切勿加 14 秒！
     double tk = NormalizeWeekCrossover(t_bdt - eph.toe);
     state.eph_expired = (std::abs(tk) > kBdsEphValidSec);
 
-    if (!ComputeClock(t_bdt, eph.toc, eph.toe, kMuBds, eph.af0, eph.af1, eph.af2, eph.tgd, eph.sqrtA, eph.e, eph.deltaN,
+    if (!ComputeClock(t_bdt, eph.toc, eph.toe, kMuBds, eph.af0, eph.af1, eph.af2, eph.sqrtA, eph.e, eph.deltaN,
                       eph.M0, state.clk_s, state.clk_drift)) {
         return false;
     }
@@ -445,22 +431,6 @@ bool ComputeBdsSatState(const BdsEph& eph, double t_bdt, double transit_time_s, 
         state.vel_ecef.x += rot_term.x;
         state.vel_ecef.y += rot_term.y;
         state.vel_ecef.z += rot_term.z;
-    }
-
-    if (IsFinite(transit_time_s) && transit_time_s != 0.0) {
-        double alpha = kOmegaEBds * transit_time_s;
-        double ca = std::cos(alpha);
-        double sa = std::sin(alpha);
-
-        double x = state.pos_ecef.x;
-        double y = state.pos_ecef.y;
-        state.pos_ecef.x = x * ca + y * sa;
-        state.pos_ecef.y = -x * sa + y * ca;
-
-        double vx = state.vel_ecef.x;
-        double vy = state.vel_ecef.y;
-        state.vel_ecef.x = vx * ca + vy * sa;
-        state.vel_ecef.y = -vx * sa + vy * ca;
     }
 
     state.valid = IsFinite(state.pos_ecef.x) && IsFinite(state.pos_ecef.y) && IsFinite(state.pos_ecef.z) &&
