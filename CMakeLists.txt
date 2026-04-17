@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(gnss_positioning_lib
+    src/Config.cpp
     src/NavMath.cpp
     src/NovatelDecoder.cpp
     src/SPP.cpp

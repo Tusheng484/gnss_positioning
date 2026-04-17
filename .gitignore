@@ -5,11 +5,13 @@ third_party/eigen/
 *.21G
 *.21L
 Novatel OEM7 Data/
+opensky/
+*.rnx
 # 忽略编译产物
 build/
 bin/
 *.exe
-
+*.py
 # 忽略解算输出和日志
 output/
 *.txt

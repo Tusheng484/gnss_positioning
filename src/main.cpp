@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief GNSS 数据流驱动的实时 SPP 单点定位程序（模块化架构）
  * @author Jiaoyang Wu
- * @date 2026-03-30
+ * @date 2026-04-17
  *
  * 修改历史：
  * - 2026-03-30：建立模块化主流程（配置管理/终端输出/文件管理/核心解算），支持星历与观测落盘。
@@ -20,11 +20,16 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <array>
 #include <map>
 #include <filesystem>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
+#include <cctype>
 
+#include <gnss_positioning/Config.h>
+#include <gnss_positioning/Logging.h>
 #include <gnss_positioning/NavMath.h>
 #include <gnss_positioning/NovatelDecoder.h>
 #include <gnss_positioning/SPP.h>
@@ -35,9 +40,10 @@ namespace {
 
 /**
  * @brief 将“系统 + PRN”组合为可用于容器索引的键
- * @param sys 卫星系统（GPS/BDS 等）
- * @param prn 卫星 PRN 编号
- * @return 键值（sys*1000 + prn），用于 map/unordered_map 等容器索引
+ * @param sys `gnss::GnssSystem` 类型卫星系统枚举，当前支持 GPS/BDS 等系统
+ * @param prn `uint32_t` 类型卫星 PRN 编号，取值范围应为各系统的有效 PRN 区间
+ * @return `uint32_t` 类型组合键，可直接用于 `std::map` / `std::unordered_map` 索引
+ * @exception 本函数不主动抛出异常
  */
 uint32_t MakeKey(gnss::GnssSystem sys, uint32_t prn) {
     return static_cast<uint32_t>(sys) * 1000U + prn;
@@ -45,8 +51,9 @@ uint32_t MakeKey(gnss::GnssSystem sys, uint32_t prn) {
 
 /**
  * @brief GPST 周内秒转 BDT 周内秒
- * @param t_gpst GPST 周内秒，范围 [0, 604800)
- * @return BDT 周内秒，范围 [0, 604800)
+ * @param t_gpst `double` 类型 GPST 周内秒，合法范围通常为 `[0, 604800)`
+ * @return `double` 类型 BDT 周内秒，结果被归一化到 `[0, 604800)` 区间
+ * @exception 本函数不主动抛出异常
  *
  * 工程口径：
  * - BDT = GPST - 14s（周内秒环绕处理）
@@ -61,10 +68,11 @@ double GpstToBdtSec(double t_gpst) {
 
 /**
  * @brief 将 GPST 时间格式化为标准“年月日时分秒”字符串
- * @param gps_time GPS 时间（周+周内秒）
- * @param out_date 输出日期字符串，格式：YYYY-MM-DD
- * @param out_time 输出时间字符串，格式：HH:MM:SS
- * @return true: 转换成功；false: 转换失败
+ * @param gps_time `gnss::GPSTIME` 类型输入时间，包含 GPS 周和周内秒
+ * @param out_date `std::string&` 类型输出参数，成功时写为 `YYYY-MM-DD`
+ * @param out_time `std::string&` 类型输出参数，成功时写为 `HH:MM:SS`
+ * @return `true` 表示转换成功；`false` 表示底层时间转换失败
+ * @exception 若字符串流分配失败，则由标准库传播异常；本函数不显式抛出业务异常
  */
 bool FormatGpsTimeYmdHms(const gnss::GPSTIME& gps_time, std::string& out_date, std::string& out_time) {
     gnss::COMMONTIME ct{};
@@ -90,391 +98,110 @@ bool FormatGpsTimeYmdHms(const gnss::GPSTIME& gps_time, std::string& out_date, s
 }
 
 /**
- * @brief 运行时配置项（由命令行与配置文件驱动）
- *
- * 设计目的：
- * - 将应用层“数据流驱动”与“算法/输出策略”解耦，避免在主循环中散落大量硬编码开关。
- * - 支持通过配置文件热更新（可选）改变输出与算法开关，减少重复编译/部署成本。
+ * @brief 解析命令行中的配置文件路径
+ * @param argc `int` 类型参数数量，取值范围应不小于 1
+ * @param argv `char**` 类型参数数组，允许为 `nullptr`，但在 `argc > 0` 时通常应包含可读字符串
+ * @return 若存在 `--config=...` 参数则返回其值；否则返回 `gnss::Config::kDefaultConfigPath`
+ * @exception 本函数不主动抛出异常；若命令行字符串构造失败，则由标准库传播异常
  */
-struct RuntimeConfig {
-    //=== INPUT/OUTPUT PATH CONFIGURATION ===================================//
-    /**
-     * @brief 输入数据路径（NovAtel OEM 二进制日志）
-     *
-     * 启用条件：
-     * - 程序启动必须可打开该文件，否则直接退出。
-     */
-    std::string input_path = "D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log";
-    /**
-     * @brief 输出目录（落盘文件统一写入该目录）
-     *
-     * 启用条件：
-     * - file_output 为 true 时生效；
-     * - openAll() 会尝试创建该目录。
-     */
-    std::string output_dir = "D:/gnss_positioning/output";
-    /**
-     * @brief 配置文件路径（key=value）
-     *
-     * 说明：
-     * - 为空表示不加载配置文件，仅使用命令行与默认值。
-     */
-    std::string config_path;
-    /**
-     * @brief 配置文件热更新开关
-     *
-     * 依赖关系：
-     * - 仅当 config_path 非空时生效；
-     * - 每次 decoder 解码出一帧完整消息后检查 last_write_time 是否变化。
-     */
-    bool watch_config = false;
-
-    //=== TERMINAL OUTPUT CONFIGURATION =====================================//
-    /**
-     * @brief 终端输出开关
-     *
-     * 控制范围：
-     * - 启动信息、每历元摘要、最终统计信息的输出。
-     *
-     * 依赖关系：
-     * - 不影响文件落盘；
-     * - 不影响算法执行，仅控制 std::cout 输出。
-     */
-    bool terminal_output = true;
-
-    //=== FILE OUTPUT CONFIGURATION =========================================//
-    /**
-     * @brief 总落盘开关
-     *
-     * 控制范围：
-     * - false：不创建 output_dir，不打开任何输出文件，writeXxx() 直接返回；
-     * - true：按各子文件开关决定是否打开对应文件。
-     */
-    bool file_output = true;
-    /**
-     * @brief SPP 解算结果落盘开关（spp_solution.txt）
-     *
-     * 依赖关系：
-     * - file_output 为 true；
-     * - enable_spp 为 true 时才会持续写入内容（未解算仅会有表头）。
-     */
-    bool file_spp_solution = true;
-    /**
-     * @brief 卫星状态落盘开关（sat_states.txt）
-     *
-     * 依赖关系：
-     * - file_output 为 true；
-     * - enable_sat_state 为 true；
-     * - 仅对每历元 freqIdx==0 的卫星输出一条状态记录。
-     */
-    bool file_sat_states = false;
-    /**
-     * @brief 星历落盘开关（gps_ephem.txt / bds_ephem.txt）
-     *
-     * 依赖关系：
-     * - file_output 为 true；
-     * - 仅当输入流中出现对应星历消息（ID=7/1696）时写入。
-     */
-    bool file_ephemeris = false;
-    /**
-     * @brief 原始观测落盘开关（range_obs.txt）
-     *
-     * 依赖关系：
-     * - file_output 为 true；
-     * - 仅当输入流中出现 RANGE 消息（ID=43）时写入。
-     */
-    bool file_observations = false;
-
-    //=== ALGORITHM CONFIGURATION ===========================================//
-    /**
-     * @brief 启用 SPP 单点定位解算
-     *
-     * 依赖关系：
-     * - true：每个 RANGE 历元调用 SPP::computeWithReport 输出定位结果；
-     * - false：跳过定位解算，仅进行星历/观测解析与（可选）卫星状态输出。
-     */
-    bool enable_spp = true;
-    /**
-     * @brief 启用卫星状态计算与输出
-     *
-     * 依赖关系：
-     * - true：每个 RANGE 历元为可匹配星历的卫星计算广播星历状态并落盘；
-     * - false：不计算卫星状态（可降低运行成本）。
-     */
-    bool enable_sat_state = true;
-
-    //=== QUALITY CONTROL CONFIGURATION =====================================//
-    /**
-     * @brief 高度角掩码（deg）
-     *
-     * 控制范围：
-     * - SPP 解算内部将低高度角卫星剔除/降权；
-     * - 该阈值过大将降低可用卫星数，过小将引入更强多路径/对流层残差影响。
-     */
-    double elev_mask_deg = 10.0;
-    /**
-     * @brief SNR 掩码（dB-Hz）
-     *
-     * 控制范围：
-     * - SPP 解算仅使用 SNR 不低于该阈值的观测，降低低质量跟踪对解算的影响。
-     */
-    double snr_mask_dbhz = 30.0;
-    /**
-     * @brief 启用无电离层组合（IF）伪距
-     *
-     * 启用条件：
-     * - 需要同一卫星同时存在 freqIdx=0 与 freqIdx=1 的有效伪距观测；
-     * - 若缺少第二频点，SPP 内会按策略跳过该卫星（以满足“单频不参与本次解算”的工程约束）。
-     */
-    bool enable_iono_free = true;
-    bool enable_tropo = true;
-    bool enable_klobuchar = true;
-    bool enable_tgd = true;
-
-    double ref_ecef_x = -2267804.5260;
-    double ref_ecef_y = 5009342.3720;
-    double ref_ecef_z = 3220991.8630;
-
-    /**
-     * @brief 启用落盘（便捷开关）
-     * @return 无
-     */
-    void enableFileOutput() { file_output = true; }
-    /**
-     * @brief 禁用落盘（便捷开关）
-     * @return 无
-     */
-    void disableFileOutput() { file_output = false; }
-    /**
-     * @brief 启用终端输出（便捷开关）
-     * @return 无
-     */
-    void enableTerminalOutput() { terminal_output = true; }
-    /**
-     * @brief 禁用终端输出（便捷开关）
-     * @return 无
-     */
-    void disableTerminalOutput() { terminal_output = false; }
-    /**
-     * @brief 启用 SPP（便捷开关）
-     * @return 无
-     */
-    void enableSpp() { enable_spp = true; }
-    /**
-     * @brief 禁用 SPP（便捷开关）
-     * @return 无
-     */
-    void disableSpp() { enable_spp = false; }
-    /**
-     * @brief 启用卫星状态落盘（便捷开关）
-     * @return 无
-     */
-    void enableSatStateOutput() { file_sat_states = true; }
-    /**
-     * @brief 禁用卫星状态落盘（便捷开关）
-     * @return 无
-     */
-    void disableSatStateOutput() { file_sat_states = false; }
-};
+std::string ResolveConfigPathFromArgs(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i] ? std::string(argv[i]) : std::string();
+        if (arg.rfind("--config=", 0) == 0) {
+            return arg.substr(9);
+        }
+    }
+    return gnss::Config::kDefaultConfigPath;
+}
 
 /**
- * @brief 配置管理器：命令行解析 + 配置文件加载 + 可选热更新
- *
- * 设计要点：
- * - 命令行参数优先级最高（先写入 cfg_），随后若提供 config_path 则读取配置文件进行覆盖。
- * - 热更新仅在 watch_config=true 且 config_path 非空时启用。
+ * @brief 将四元素浮点数组格式化为日志友好的字符串
+ * @param values `std::array<double, 4>` 类型数组，表示 Klobuchar `alpha` 或 `beta` 参数
+ * @return 形如 `[a0, a1, a2, a3]` 的字符串
+ * @exception 若字符串流写入失败，则由标准库流状态记录错误，不主动抛出异常
  */
-class ConfigManager {
-public:
-    /**
-     * @brief 获取当前配置（只读）
-     * @return 配置只读引用
-     */
-    const RuntimeConfig& config() const { return cfg_; }
-    /**
-     * @brief 获取当前配置（可写）
-     * @return 配置可写引用
-     */
-    RuntimeConfig& config() { return cfg_; }
+std::string FormatArray4(const std::array<double, 4>& values) {
+    std::ostringstream oss;
+    oss << "[" << values[0] << ", " << values[1] << ", " << values[2] << ", " << values[3] << "]";
+    return oss.str();
+}
 
-    /**
-     * @brief 从命令行参数加载配置
-     * @param argc 参数数量
-     * @param argv 参数数组
-     * @return 无
-     *
-     * 支持的参数示例：
-     * - --input=xxx
-     * - --outdir=xxx
-     * - --config=xxx
-     * - --elev-mask=10.0
-     * - --snr-mask=30.0
-     * - --iono-free / --no-iono-free
-     * - --no-terminal / --no-file / --no-spp / --no-sat 等
-     */
-    void loadFromArgs(int argc, char** argv) {
-        for (int i = 1; i < argc; ++i) {
-            const std::string arg = argv[i] ? std::string(argv[i]) : std::string();
-            if (arg.rfind("--input=", 0) == 0) cfg_.input_path = arg.substr(8);
-            else if (arg.rfind("--outdir=", 0) == 0) cfg_.output_dir = arg.substr(9);
-            else if (arg.rfind("--config=", 0) == 0) cfg_.config_path = arg.substr(9);
-            else if (arg == "--no-terminal") cfg_.terminal_output = false;
-            else if (arg == "--no-file") cfg_.file_output = false;
-            else if (arg == "--no-spp") cfg_.enable_spp = false;
-            else if (arg == "--no-sat") cfg_.enable_sat_state = false;
-            else if (arg == "--no-spp-file") cfg_.file_spp_solution = false;
-            else if (arg == "--no-sat-file") cfg_.file_sat_states = false;
-            else if (arg == "--no-eph-file") cfg_.file_ephemeris = false;
-            else if (arg == "--no-obs-file") cfg_.file_observations = false;
-            else if (arg == "--no-config-watch") cfg_.watch_config = false;
-            else if (arg.rfind("--elev-mask=", 0) == 0) cfg_.elev_mask_deg = std::stod(arg.substr(12));
-            else if (arg.rfind("--snr-mask=", 0) == 0) cfg_.snr_mask_dbhz = std::stod(arg.substr(11));
-            else if (arg == "--iono-free") cfg_.enable_iono_free = true;
-            else if (arg == "--no-iono-free") cfg_.enable_iono_free = false;
-            else if (arg == "--tropo") cfg_.enable_tropo = true;
-            else if (arg == "--no-tropo") cfg_.enable_tropo = false;
-            else if (arg == "--klobuchar") cfg_.enable_klobuchar = true;
-            else if (arg == "--no-klobuchar") cfg_.enable_klobuchar = false;
-            else if (arg == "--tgd") cfg_.enable_tgd = true;
-            else if (arg == "--no-tgd") cfg_.enable_tgd = false;
-            else if (arg.rfind("--ref-x=", 0) == 0) cfg_.ref_ecef_x = std::stod(arg.substr(8));
-            else if (arg.rfind("--ref-y=", 0) == 0) cfg_.ref_ecef_y = std::stod(arg.substr(8));
-            else if (arg.rfind("--ref-z=", 0) == 0) cfg_.ref_ecef_z = std::stod(arg.substr(8));
-        }
+/**
+ * @brief 输出最终生效的关键配置参数
+ * @param cfg `gnss::Config` 常量引用，表示已完成加载与校验的只读配置
+ * @return 无
+ * @exception 若日志流写入失败，则由标准输出流状态记录错误，不主动抛出异常
+ *
+ * 说明：
+ * - 该函数专门用于运维确认启动参数是否与配置文件一致；
+ * - Klobuchar 相关开关、`alpha/beta` 参数会被完整打印。
+ */
+void LogEffectiveConfig(const gnss::Config& cfg) {
+    const auto& spp = cfg.sppOptions();
+    const auto& ref = cfg.referenceEcef();
 
-
-        if (!cfg_.config_path.empty()) {
-            loadFromFile(cfg_.config_path);
-            updateConfigTimestamp();
-        }
-    }
-
-    /**
-     * @brief 配置文件热更新：检测文件时间戳变化后重新加载
-     * @return 无
-     *
-     * 运行机制：
-     * - 每当解码器解析到一帧完整消息后调用一次；
-     * - 若 last_write_time 与上次记录不同，则重新加载并更新缓存时间戳。
-     */
-    void reloadIfChanged() {
-        if (!cfg_.watch_config || cfg_.config_path.empty()) return;
-        std::error_code ec;
-        auto ts = std::filesystem::last_write_time(cfg_.config_path, ec);
-        if (ec) return;
-        if (!has_ts_ || ts != last_ts_) {
-            loadFromFile(cfg_.config_path);
-            last_ts_ = ts;
-            has_ts_ = true;
-        }
-    }
-
-private:
-    /**
-     * @brief 从配置文件加载 key=value 并写入 cfg_
-     * @param path 配置文件路径
-     * @return true: 加载成功；false: 文件不可读或打开失败
-     */
-    bool loadFromFile(const std::string& path) {
-        std::ifstream in(path);
-        if (!in.is_open()) return false;
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            if (line[0] == '#') continue;
-            auto pos = line.find('=');
-            if (pos == std::string::npos) continue;
-            std::string key = line.substr(0, pos);
-            std::string val = line.substr(pos + 1);
-            trim(key);
-            trim(val);
-
-            if (key == "input_path") cfg_.input_path = val;
-            else if (key == "output_dir") cfg_.output_dir = val;
-            else if (key == "terminal_output") cfg_.terminal_output = (val == "1" || val == "true");
-            else if (key == "file_output") cfg_.file_output = (val == "1" || val == "true");
-            else if (key == "file_spp_solution") cfg_.file_spp_solution = (val == "1" || val == "true");
-            else if (key == "file_sat_states") cfg_.file_sat_states = (val == "1" || val == "true");
-            else if (key == "file_ephemeris") cfg_.file_ephemeris = (val == "1" || val == "true");
-            else if (key == "file_observations") cfg_.file_observations = (val == "1" || val == "true");
-            else if (key == "enable_spp") cfg_.enable_spp = (val == "1" || val == "true");
-            else if (key == "enable_sat_state") cfg_.enable_sat_state = (val == "1" || val == "true");
-            else if (key == "elev_mask_deg") cfg_.elev_mask_deg = std::stod(val);
-            else if (key == "snr_mask_dbhz") cfg_.snr_mask_dbhz = std::stod(val);
-            else if (key == "enable_iono_free") cfg_.enable_iono_free = (val == "1" || val == "true");
-            else if (key == "enable_tropo") cfg_.enable_tropo = (val == "1" || val == "true");
-            else if (key == "enable_klobuchar") cfg_.enable_klobuchar = (val == "1" || val == "true");
-            else if (key == "enable_tgd") cfg_.enable_tgd = (val == "1" || val == "true");
-            else if (key == "ref_ecef_x") cfg_.ref_ecef_x = std::stod(val);
-            else if (key == "ref_ecef_y") cfg_.ref_ecef_y = std::stod(val);
-            else if (key == "ref_ecef_z") cfg_.ref_ecef_z = std::stod(val);
-        }
-        return true;
-    }
-
-    /**
-     * @brief 记录配置文件当前时间戳
-     * @return 无
-     */
-    void updateConfigTimestamp() {
-        std::error_code ec;
-        last_ts_ = std::filesystem::last_write_time(cfg_.config_path, ec);
-        has_ts_ = !ec;
-    }
-
-    /**
-     * @brief 去除字符串首尾空白字符（空格/制表符/换行等）
-     * @param s 输入输出字符串
-     * @return 无
-     */
-    static void trim(std::string& s) {
-        auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
-        while (!s.empty() && is_space(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-        while (!s.empty() && is_space(static_cast<unsigned char>(s.back()))) s.pop_back();
-    }
-
-private:
-    RuntimeConfig cfg_;
-    std::filesystem::file_time_type last_ts_{};
-    bool has_ts_ = false;
-};
+    LOG(INFO) << "CONFIG_PATH=" << cfg.sourcePath();
+    LOG(INFO) << "INPUT_PATH=" << cfg.inputPath();
+    LOG(INFO) << "OUTPUT_DIR=" << cfg.outputDir();
+    LOG(INFO) << "TERMINAL_OUTPUT=" << (cfg.terminalOutputEnabled() ? "true" : "false");
+    LOG(INFO) << "FILE_OUTPUT=" << (cfg.fileOutputEnabled() ? "true" : "false");
+    LOG(INFO) << "ENABLE_SPP=" << (cfg.sppEnabled() ? "true" : "false");
+    LOG(INFO) << "ENABLE_SAT_STATE=" << (cfg.satStateEnabled() ? "true" : "false");
+    LOG(INFO) << "SPP_MODE=" << gnss::ToString(spp.frequency_mode);
+    LOG(INFO) << "SPP_ENABLE_TROPO=" << (spp.enable_tropo ? "true" : "false");
+    LOG(INFO) << "SPP_ENABLE_TGD=" << (spp.enable_tgd ? "true" : "false");
+    LOG(INFO) << "SPP_ENABLE_KLOBUCHAR_MODEL=" << (spp.enable_klobuchar_model ? "true" : "false");
+    LOG(INFO) << "SPP_ELEV_MASK_DEG=" << spp.elev_mask_deg;
+    LOG(INFO) << "SPP_SNR_MASK_DBHZ=" << spp.snr_mask_dbhz;
+    LOG(INFO) << "GPS_KLOBUCHAR_ENABLED=" << (spp.gps_klobuchar.enabled ? "true" : "false");
+    LOG(INFO) << "GPS_KLOBUCHAR_ALPHA=" << FormatArray4(spp.gps_klobuchar.alpha);
+    LOG(INFO) << "GPS_KLOBUCHAR_BETA=" << FormatArray4(spp.gps_klobuchar.beta);
+    LOG(INFO) << "BDS_KLOBUCHAR_ENABLED=" << (spp.bds_klobuchar.enabled ? "true" : "false");
+    LOG(INFO) << "BDS_KLOBUCHAR_ALPHA=" << FormatArray4(spp.bds_klobuchar.alpha);
+    LOG(INFO) << "BDS_KLOBUCHAR_BETA=" << FormatArray4(spp.bds_klobuchar.beta);
+    LOG(INFO) << "REFERENCE_ECEF_XYZ=" << ref.x << "," << ref.y << "," << ref.z;
+}
 
 /**
  * @brief 终端输出模块：负责运行过程中的可读性输出
  *
  * 说明：
  * - 该模块仅做“展示”，不参与任何定位领域逻辑判断；
- * - 输出开关由 RuntimeConfig::terminal_output 控制。
+ * - 输出开关由 `gnss::Config::terminalOutputEnabled()` 控制。
  */
 class TerminalOutput {
 public:
     /**
      * @brief 设置终端输出是否启用
-     * @param enabled true: 输出；false: 静默
+     * @param enabled `bool` 类型开关，`true` 表示允许输出，`false` 表示静默
      * @return 无
+     * @exception 本函数不主动抛出异常
      */
     void setEnabled(bool enabled) { enabled_ = enabled; }
 
     /**
-     * @brief 输出启动信息（输入/输出路径、配置文件等）
-     * @param cfg 运行时配置
+     * @brief 输出程序启动摘要
+     * @param cfg `gnss::Config` 常量引用，表示已校验通过的只读配置
      * @return 无
+     * @exception 本函数不主动抛出异常；若标准输出失败，则由流状态记录错误
      */
-    void printStartup(const RuntimeConfig& cfg) {
+    void printStartup(const gnss::Config& cfg) {
         if (!enabled_) return;
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "GNSS SPP 定位程序" << std::endl;
-        std::cout << "INPUT=" << cfg.input_path << std::endl;
-        std::cout << "OUTPUT_DIR=" << cfg.output_dir << std::endl;
-        if (!cfg.config_path.empty()) std::cout << "CONFIG=" << cfg.config_path << std::endl;
+        std::cout << "INPUT=" << cfg.inputPath() << std::endl;
+        std::cout << "OUTPUT_DIR=" << cfg.outputDir() << std::endl;
+        std::cout << "SPP_MODE=" << gnss::ToString(cfg.sppOptions().frequency_mode) << std::endl;
+        std::cout << "CONFIG=" << cfg.sourcePath() << std::endl;
     }
 
     /**
      * @brief 输出单历元摘要（用于观察解算是否稳定、卫星匹配是否满足）
-     * @param gps_time 当前历元 GPS 时间（用于格式化输出年月日时分秒）
-     * @param report SPP 输出的历元报告
-     * @param ok 解算结果标志（true: 成功；false: 失败）
+     * @param gps_time `gnss::GPSTIME` 类型当前历元时间，周内秒通常位于 `[0, 604800)`
+     * @param report `gnss::SppEpochReport` 常量引用，包含本历元解算摘要
+     * @param ok `bool` 类型解算标志，`true` 表示成功，`false` 表示失败
      * @return 无
+     * @exception 本函数不主动抛出异常；若输出流失败，则由流状态记录
      */
     void printEpoch(const gnss::GPSTIME& gps_time, const gnss::SppEpochReport& report, bool ok) {
         if (!enabled_) return;
@@ -499,20 +226,21 @@ public:
 
     /**
      * @brief 输出全流程统计摘要（用于处理量级与异常跳过原因分析）
-     * @param total_bytes 读取的总字节数
-     * @param range_frames RANGE 历元数量（消息 ID=43）
-     * @param gps_eph GPS 星历数量（消息 ID=7）
-     * @param bds_eph BDS 星历数量（消息 ID=1696）
-     * @param solve_attempt 实际进入 SPP 解算的历元数量
-     * @param spp_ok SPP 解算成功历元数量
-     * @param spp_fail SPP 解算失败历元数量
-     * @param skip_no_eph 由于无星历导致未尝试解算的历元数量
-     * @param skip_low_match 由于匹配星历不足导致未尝试解算的历元数量
-     * @param sat_total 卫星状态计算尝试次数（按历元×卫星计数）
-     * @param sat_no_eph 无星历导致未计算卫星状态次数
-     * @param sat_ok 卫星状态计算成功次数（函数返回 true）
-     * @param sat_valid 卫星状态数值有效次数（st.valid=true）
+     * @param total_bytes `uint32_t` 类型累计读取字节数，取值范围 `[0, 2^32-1]`
+     * @param range_frames `uint32_t` 类型 RANGE 历元数量，消息 ID 为 43
+     * @param gps_eph `uint32_t` 类型 GPS 星历数量，消息 ID 为 7
+     * @param bds_eph `uint32_t` 类型 BDS 星历数量，消息 ID 为 1696
+     * @param solve_attempt `uint32_t` 类型进入 SPP 解算的历元数量
+     * @param spp_ok `uint32_t` 类型解算成功历元数量
+     * @param spp_fail `uint32_t` 类型解算失败历元数量
+     * @param skip_no_eph `uint32_t` 类型因无星历跳过的历元数量
+     * @param skip_low_match `uint32_t` 类型因匹配不足跳过的历元数量
+     * @param sat_total `uint64_t` 类型卫星状态计算尝试总次数
+     * @param sat_no_eph `uint64_t` 类型因无星历跳过的卫星状态次数
+     * @param sat_ok `uint64_t` 类型卫星状态计算成功次数
+     * @param sat_valid `uint64_t` 类型卫星状态数值有效次数
      * @return 无
+     * @exception 本函数不主动抛出异常；若输出流失败，则由流状态记录
      */
     void printSummary(uint32_t total_bytes,
                       uint32_t range_frames,
@@ -560,31 +288,33 @@ class FileManager {
 public:
     /**
      * @brief 构造文件管理器
-     * @param cfg 运行时配置（引用保存，生命周期由调用方保证）
+     * @param cfg `gnss::Config` 常量引用，表示已完成加载和校验的全局配置
      */
-    explicit FileManager(const RuntimeConfig& cfg) : cfg_(cfg) {}
+    explicit FileManager(const gnss::Config& cfg) : cfg_(cfg) {}
 
     /**
      * @brief 打开所有启用的输出文件并写入表头
-     * @return true: 成功；false: 目录创建或文件打开失败
+     * @return `true` 表示输出目录和目标文件均已准备完成；`false` 表示目录创建或文件打开失败
+     * @exception 本函数不主动抛出异常；文件系统错误通过返回值和流状态表达
      */
     bool openAll() {
-        if (!cfg_.file_output) return true;
+        // 总落盘关闭时直接返回，避免触发任何目录或文件副作用。
+        if (!cfg_.fileOutputEnabled()) return true;
 
         std::error_code ec;
-        std::filesystem::create_directories(cfg_.output_dir, ec);
+        std::filesystem::create_directories(cfg_.outputDir(), ec);
         if (ec) return false;
 
-        if (cfg_.file_spp_solution) {
-            spp_path_ = (std::filesystem::path(cfg_.output_dir) / "spp_solution.txt").string();
+        if (cfg_.fileSppSolutionEnabled()) {
+            spp_path_ = (std::filesystem::path(cfg_.outputDir()) / "spp_solution.txt").string();
             spp_file_.open(spp_path_);
             if (!spp_file_.is_open()) return false;
             spp_file_.setf(std::ios::fixed, std::ios::floatfield);
             spp_file_ << "Wk SOW ECEF-X/m ECEF-Y/m ECEF-Z/m REF-ECEF-X/m REF-ECEF-Y/m REF-ECEF-Z/m EAST/m NORTH/m UP/m B/deg L/deg H/m VX/m VY/m VZ/m PDOP SigmaP SigmaV GS BS n" << std::endl;
         }
 
-        if (cfg_.file_sat_states) {
-            sat_path_ = (std::filesystem::path(cfg_.output_dir) / "sat_states.txt").string();
+        if (cfg_.fileSatStatesEnabled()) {
+            sat_path_ = (std::filesystem::path(cfg_.outputDir()) / "sat_states.txt").string();
             sat_file_.open(sat_path_);
             if (!sat_file_.is_open()) return false;
             sat_file_ << "* 通用时 (计算时刻)" << std::endl;
@@ -593,9 +323,9 @@ public:
             sat_file_ << "注意：卫星号前“B”表示广播星历，卫星位置、钟差等均未经任何改正" << std::endl;
         }
 
-        if (cfg_.file_ephemeris) {
-            gps_eph_path_ = (std::filesystem::path(cfg_.output_dir) / "gps_ephem.txt").string();
-            bds_eph_path_ = (std::filesystem::path(cfg_.output_dir) / "bds_ephem.txt").string();
+        if (cfg_.fileEphemerisEnabled()) {
+            gps_eph_path_ = (std::filesystem::path(cfg_.outputDir()) / "gps_ephem.txt").string();
+            bds_eph_path_ = (std::filesystem::path(cfg_.outputDir()) / "bds_ephem.txt").string();
             gps_eph_file_.open(gps_eph_path_);
             bds_eph_file_.open(bds_eph_path_);
             if (!gps_eph_file_.is_open() || !bds_eph_file_.is_open()) return false;
@@ -616,8 +346,8 @@ public:
                           << std::endl;
         }
 
-        if (cfg_.file_observations) {
-            obs_path_ = (std::filesystem::path(cfg_.output_dir) / "range_obs.txt").string();
+        if (cfg_.fileObservationsEnabled()) {
+            obs_path_ = (std::filesystem::path(cfg_.outputDir()) / "range_obs.txt").string();
             obs_file_.open(obs_path_);
             if (!obs_file_.is_open()) return false;
             obs_file_.setf(std::ios::fixed, std::ios::floatfield);
@@ -630,21 +360,24 @@ public:
 
     /**
      * @brief 写入单历元 SPP 报告（spp_solution.txt）
-     * @param gps_time 当前历元 GPS 时间（用于格式化输出年月日时分秒）
-     * @param report SPP 历元报告
+     * @param gps_time `gnss::GPSTIME` 类型当前历元时间
+     * @param report `gnss::SppEpochReport` 常量引用，包含本历元定位结果和统计字段
      * @return 无
+     * @exception 本函数不主动抛出异常；当文件未打开或落盘关闭时直接返回
      *
      * 说明：
      * - report.attempted / report.ok 等字段由 SPP 模块负责填充；
      * - 此处仅按表头顺序输出，便于后处理脚本解析。
      */
     void writeSppReport(const gnss::GPSTIME& gps_time, const gnss::SppEpochReport& report) {
-        if (!cfg_.file_output || !cfg_.file_spp_solution) return;
+        // 任一文件开关关闭时直接返回，保持调用端无需额外判断。
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileSppSolutionEnabled()) return;
         if (!spp_file_.is_open()) return;
-        if (!has_ref_ && (cfg_.ref_ecef_x != 0.0 || cfg_.ref_ecef_y != 0.0 || cfg_.ref_ecef_z != 0.0)) {
-            ref_xyz_.x = cfg_.ref_ecef_x;
-            ref_xyz_.y = cfg_.ref_ecef_y;
-            ref_xyz_.z = cfg_.ref_ecef_z;
+        const auto& ref = cfg_.referenceEcef();
+        if (!has_ref_ && (ref.x != 0.0 || ref.y != 0.0 || ref.z != 0.0)) {
+            ref_xyz_.x = ref.x;
+            ref_xyz_.y = ref.y;
+            ref_xyz_.z = ref.z;
             has_ref_ = true;
         }
         if (!has_ref_ && report.ok) {
@@ -696,11 +429,12 @@ public:
 
     /**
      * @brief 写入卫星状态文件的历元分隔头（通用时 + GPS 周/周内秒）
-     * @param gps_time 当前历元的 GPS 时间（周+周内秒）
+     * @param gps_time `gnss::GPSTIME` 类型当前历元时间，包含周号和周内秒
      * @return 无
+     * @exception 本函数不主动抛出异常；若文件未打开则直接返回
      */
     void writeSatEpochHeader(const gnss::GPSTIME& gps_time) {
-        if (!cfg_.file_output || !cfg_.file_sat_states) return;
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileSatStatesEnabled()) return;
         if (!sat_file_.is_open()) return;
         gnss::COMMONTIME ct;
         gnss::GpsTimeToCommonTime(gps_time, ct);
@@ -712,17 +446,18 @@ public:
 
     /**
      * @brief 写入单颗卫星的广播星历状态（sat_states.txt）
-     * @param sys 卫星系统（GPS/BDS）
-     * @param prn 卫星 PRN
-     * @param st 卫星状态（位置/速度/钟差/钟速）
+     * @param sys `gnss::GnssSystem` 类型卫星系统，当前按 GPS/BDS 输出
+     * @param prn `uint32_t` 类型卫星 PRN 号，取值应落在系统合法区间
+     * @param st `gnss::SatState` 常量引用，包含位置、速度、钟差与钟速
      * @return 无
+     * @exception 本函数不主动抛出异常；若文件未打开则直接返回
      *
      * 注意：
      * - 输出文件用于验证卫星广播轨道计算口径；
      * - “B”前缀表示仅广播星历状态，不叠加 SPP 观测改正项。
      */
     void writeSatStateLine(gnss::GnssSystem sys, uint32_t prn, const gnss::SatState& st) {
-        if (!cfg_.file_output || !cfg_.file_sat_states) return;
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileSatStatesEnabled()) return;
         if (!sat_file_.is_open()) return;
         char sys_char = (sys == gnss::GnssSystem::GPS) ? 'G' : 'C';
         sat_file_ << "B" << sys_char << std::setw(2) << std::setfill('0') << prn << std::setfill(' ') << "  "
@@ -740,11 +475,12 @@ public:
 
     /**
      * @brief 写入 GPS 星历（gps_ephem.txt）
-     * @param e GPS 星历结构体（来自解码器缓存）
+     * @param e `gnss::GpsEphem` 常量引用，来自解码器缓存的 GPS 广播星历
      * @return 无
+     * @exception 本函数不主动抛出异常；若文件未打开则直接返回
      */
     void writeGpsEphem(const gnss::GpsEphem& e) {
-        if (!cfg_.file_output || !cfg_.file_ephemeris) return;
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileEphemerisEnabled()) return;
         if (!gps_eph_file_.is_open()) return;
         gps_eph_file_ << e.tow << " "
                       << e.prn << " "
@@ -777,11 +513,12 @@ public:
 
     /**
      * @brief 写入 BDS 星历（bds_ephem.txt）
-     * @param e BDS 星历结构体（来自解码器缓存）
+     * @param e `gnss::BdsEphem` 常量引用，来自解码器缓存的 BDS 广播星历
      * @return 无
+     * @exception 本函数不主动抛出异常；若文件未打开则直接返回
      */
     void writeBdsEphem(const gnss::BdsEphem& e) {
-        if (!cfg_.file_output || !cfg_.file_ephemeris) return;
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileEphemerisEnabled()) return;
         if (!bds_eph_file_.is_open()) return;
         bds_eph_file_ << e.prn << " "
                       << e.week << " "
@@ -813,13 +550,14 @@ public:
 
     /**
      * @brief 写入 RANGE 观测（range_obs.txt）
-     * @param week 当前 GPS 周
-     * @param tow 当前周内秒（GPST）
-     * @param obs_list 当前历元观测列表
+     * @param week `uint16_t` 类型当前 GPS 周号，取值范围 `[0, 65535]`
+     * @param tow `double` 类型当前 GPST 周内秒，通常位于 `[0, 604800)`
+     * @param obs_list `std::vector<gnss::ObsData>` 常量引用，表示当前历元全部观测
      * @return 无
+     * @exception 本函数不主动抛出异常；若文件未打开则直接返回
      */
     void writeObs(uint16_t week, double tow, const std::vector<gnss::ObsData>& obs_list) {
-        if (!cfg_.file_output || !cfg_.file_observations) return;
+        if (!cfg_.fileOutputEnabled() || !cfg_.fileObservationsEnabled()) return;
         if (!obs_file_.is_open()) return;
         for (const auto& o : obs_list) {
             char sys_char = 'U';
@@ -834,12 +572,14 @@ public:
 
     /**
      * @brief 获取 spp_solution.txt 输出路径（若未启用则为空字符串）
-     * @return 输出路径引用
+     * @return `const std::string&` 类型输出路径引用；未启用时可能为空字符串
+     * @exception 本函数不主动抛出异常
      */
     const std::string& sppPath() const { return spp_path_; }
     /**
      * @brief 获取 sat_states.txt 输出路径（若未启用则为空字符串）
-     * @return 输出路径引用
+     * @return `const std::string&` 类型输出路径引用；未启用时可能为空字符串
+     * @exception 本函数不主动抛出异常
      */
     const std::string& satPath() const { return sat_path_; }
 
@@ -847,7 +587,7 @@ private:
     /**
      * @brief 运行时配置引用（由 main() 生命周期托管）
      */
-    const RuntimeConfig& cfg_;
+    const gnss::Config& cfg_;
     bool has_ref_ = false;
     gnss::XYZ ref_xyz_ = {0.0, 0.0, 0.0};
 
@@ -875,25 +615,54 @@ class SppCore {
 public:
     /**
      * @brief 构造并初始化 SPP 解算器参数
-     * @param cfg 运行时配置
+     * @param cfg `gnss::Config` 常量引用，表示已完成校验的只读参数集合
+     * @return 无
+     * @exception 若底层 `SPP` 参数注入失败，则由标准库或下层代码传播异常
      */
-    explicit SppCore(const RuntimeConfig& cfg) {
-        solver_.setElevationMaskDeg(cfg.elev_mask_deg);
-        solver_.setSnrMaskDbHz(cfg.snr_mask_dbhz);
-        solver_.setEnableIonoFree(cfg.enable_iono_free);
-        solver_.setEnableTroposphere(cfg.enable_tropo);
-        solver_.setEnableKlobucharIono(cfg.enable_klobuchar);
-        solver_.setEnableTgdCorrection(cfg.enable_tgd);
+    explicit SppCore(const gnss::Config& cfg) {
+        applyConfig(cfg);
+    }
+
+    /**
+     * @brief 将集中式配置应用到 SPP 解算器
+     * @param cfg `gnss::Config` 常量引用，要求已经过范围与依赖关系校验
+     * @return 无
+     * @exception 本函数不主动抛出异常；若底层容器或字符串操作失败，则由标准库传播异常
+     */
+    void applyConfig(const gnss::Config& cfg) {
+        const auto& spp = cfg.sppOptions();
+        solver_.setElevationMaskDeg(spp.elev_mask_deg);
+        solver_.setSnrMaskDbHz(spp.snr_mask_dbhz);
+        solver_.setEnableIonoFree(spp.useIonoFree());
+        solver_.setEnableTroposphere(spp.enable_tropo);
+        solver_.setEnableKlobucharIono(spp.useKlobuchar());
+        solver_.setEnableTgdCorrection(spp.enable_tgd);
+
+        if (spp.gps_klobuchar.enabled) {
+            solver_.setGpsKlobucharParams(spp.gps_klobuchar.alpha.data(),
+                                          spp.gps_klobuchar.beta.data());
+        } else {
+            solver_.setGpsKlobucharParams(nullptr, nullptr);
+        }
+
+        if (spp.bds_klobuchar.enabled) {
+            solver_.setBdsKlobucharParams(spp.bds_klobuchar.alpha.data(),
+                                          spp.bds_klobuchar.beta.data());
+        } else {
+            solver_.setBdsKlobucharParams(nullptr, nullptr);
+        }
+
         solver_.setVerbose(false);
     }
 
     /**
      * @brief 执行单历元 SPP 解算并生成报告
-     * @param tow_gpst 历元时刻（GPST 周内秒）
-     * @param obs_list 当前历元观测列表
-     * @param eph_list 当前可用星历列表
-     * @param report 输出的历元报告
-     * @return true: 解算成功；false: 解算失败或数据不足
+     * @param tow_gpst `double` 类型历元时刻，表示 GPST 周内秒，通常位于 `[0, 604800)`
+     * @param obs_list `std::vector<gnss::ObsData>` 常量引用，表示当前历元观测列表
+     * @param eph_list `std::vector<gnss::Ephemeris>` 常量引用，表示当前可用星历列表
+     * @param report `gnss::SppEpochReport&` 输出参数，返回本历元解算报告
+     * @return `true` 表示解算成功；`false` 表示数据不足或数值失败
+     * @exception 本函数不主动抛出异常；异常由底层解算器或标准库传播
      */
     bool compute(double tow_gpst,
                  const std::vector<gnss::ObsData>& obs_list,
@@ -904,7 +673,8 @@ public:
 
     /**
      * @brief 获取最近一次解算位置（ECEF）
-     * @return {X,Y,Z} 米
+     * @return `std::vector<double>` 类型三元素位置向量，单位为米
+     * @exception 本函数不主动抛出异常
      */
     std::vector<double> lastPosition() const { return solver_.getPosition(); }
 
@@ -923,12 +693,13 @@ class SatStateCore {
 public:
     /**
      * @brief 在指定 GPST 周内秒计算单颗卫星状态
-     * @param sys 卫星系统
-     * @param prn 卫星 PRN
-     * @param tow_gpst 计算时刻（GPST 周内秒）
-     * @param eph 统一格式星历（由解码器转换得到）
-     * @param st 输出卫星状态
-     * @return true: 计算成功；false: 不支持系统或计算失败
+     * @param sys `gnss::GnssSystem` 类型卫星系统
+     * @param prn `uint32_t` 类型卫星 PRN 号
+     * @param tow_gpst `double` 类型计算时刻，表示 GPST 周内秒
+     * @param eph `gnss::Ephemeris` 常量引用，表示统一格式广播星历
+     * @param st `gnss::SatState&` 输出参数，返回卫星位置、速度与钟差状态
+     * @return `true` 表示计算成功；`false` 表示系统不支持或状态计算失败
+     * @exception 本函数不主动抛出异常；底层异常由计算函数传播
      *
      * 时间口径：
      * - GPS：直接使用 GPST；
@@ -953,8 +724,9 @@ public:
 private:
     /**
      * @brief 统一星历转 GPS 广播星历输入结构体（字段搬运）
-     * @param eph 统一星历
-     * @return GPS 星历输入结构体
+     * @param eph `gnss::Ephemeris` 常量引用，表示统一格式星历
+     * @return `gnss::GpsEph` 类型 GPS 广播星历输入结构体
+     * @exception 本函数不主动抛出异常
      */
     static gnss::GpsEph toGpsEph(const gnss::Ephemeris& eph) {
         gnss::GpsEph out;
@@ -985,8 +757,9 @@ private:
 
     /**
      * @brief 统一星历转 BDS 广播星历输入结构体（字段搬运）
-     * @param eph 统一星历
-     * @return BDS 星历输入结构体
+     * @param eph `gnss::Ephemeris` 常量引用，表示统一格式星历
+     * @return `gnss::BdsEph` 类型 BDS 广播星历输入结构体
+     * @exception 本函数不主动抛出异常
      */
     static gnss::BdsEph toBdsEph(const gnss::Ephemeris& eph) {
         gnss::BdsEph out;
@@ -1020,12 +793,13 @@ private:
 
 /**
  * @brief 程序入口：驱动数据解码、预处理、SPP 解算与结果输出
- * @param argc 命令行参数数量
- * @param argv 命令行参数数组
- * @return 0: 正常退出；非 0: 异常退出
+ * @param argc `int` 类型命令行参数数量，取值范围应不小于 1
+ * @param argv `char**` 类型命令行参数数组，支持通过 `--config=...` 指定配置文件路径
+ * @return `0` 表示正常退出；`1` 表示输入或输出初始化失败；`2` 表示运行期间抛出异常
+ * @exception 本函数捕获全部 `std::exception` 派生异常，并转换为返回码 `2`
  *
  * 主流程（按数据流驱动组织）：
- * 1) 读取命令行与配置文件（可选热更新）
+ * 1) 读取命令行并一次性加载配置文件
  * 2) 初始化终端输出与输出文件
  * 3) 流式读取 OEM 二进制数据，解码消息帧
  * 4) 星历消息：缓存并落盘
@@ -1034,30 +808,31 @@ private:
  */
 int main(int argc, char** argv) {
     try {
-        ConfigManager cfg_mgr;
-        cfg_mgr.loadFromArgs(argc, argv);
+        const std::string config_path = ResolveConfigPathFromArgs(argc, argv);
+        const gnss::Config cfg = gnss::Config::LoadFromYaml(config_path);
+        LogEffectiveConfig(cfg);
 
         TerminalOutput term;
-        term.setEnabled(cfg_mgr.config().terminal_output);
-        term.printStartup(cfg_mgr.config());
+        term.setEnabled(cfg.terminalOutputEnabled());
+        term.printStartup(cfg);
 
         // 打开输入文件（OEM 二进制日志）。
-        std::ifstream in_file(cfg_mgr.config().input_path, std::ios::binary);
+        std::ifstream in_file(cfg.inputPath(), std::ios::binary);
         if (!in_file.is_open()) {
-            std::cerr << "[ERROR] 无法打开输入文件: " << cfg_mgr.config().input_path << std::endl;
+            std::cerr << "[ERROR] 无法打开输入文件: " << cfg.inputPath() << std::endl;
             return 1;
         }
 
         // 初始化输出目录与各类落盘文件（由配置控制）。
-        FileManager files(cfg_mgr.config());
+        FileManager files(cfg);
         if (!files.openAll()) {
-            std::cerr << "[ERROR] 输出文件初始化失败: " << cfg_mgr.config().output_dir << std::endl;
+            std::cerr << "[ERROR] 输出文件初始化失败: " << cfg.outputDir() << std::endl;
             return 1;
         }
 
         // 初始化解码器与 SPP 解算核心。
         gnss::NovatelDecoder decoder;
-        SppCore spp(cfg_mgr.config());
+        SppCore spp(cfg);
 
         // 星历缓存：key=(sys,prn) -> Ephemeris。
         // 生命周期：贯穿整个程序运行，随着消息流持续更新（用于后续历元的星历匹配）。
@@ -1089,10 +864,6 @@ int main(int argc, char** argv) {
         while (in_file.read(reinterpret_cast<char*>(&byte), 1)) {
             total_bytes++;
             if (!decoder.inputData(byte)) continue;
-
-            // 配置热更新：仅在 watch_config=true 时生效。
-            cfg_mgr.reloadIfChanged();
-            term.setEnabled(cfg_mgr.config().terminal_output);
 
             uint16_t msg_id = decoder.getMsgId();
 
@@ -1133,7 +904,7 @@ int main(int argc, char** argv) {
             files.writeSatEpochHeader(gps_time);
 
             // 卫星状态输出：对本历元出现的（GPS/BDS、freqIdx=0）卫星，若能匹配到星历则计算状态并写入。
-            if (cfg_mgr.config().enable_sat_state && cfg_mgr.config().file_output && cfg_mgr.config().file_sat_states) {
+            if (cfg.satStateEnabled() && cfg.fileOutputEnabled() && cfg.fileSatStatesEnabled()) {
                 std::map<uint32_t, gnss::ObsData> uniq_obs;
                 for (const auto& obs : obs_list) {
                     if (obs.system != gnss::GnssSystem::GPS && obs.system != gnss::GnssSystem::BDS) continue;
@@ -1158,7 +929,7 @@ int main(int argc, char** argv) {
             }
 
             // SPP 解算开关：禁用时跳过定位，仅完成解析与落盘。
-            if (!cfg_mgr.config().enable_spp) continue;
+            if (!cfg.sppEnabled()) continue;
 
             // 将当前缓存的全部星历转为线性列表（SPP 内部自行按 sys/prn 匹配）。
             std::vector<gnss::Ephemeris> eph_list;
@@ -1207,15 +978,15 @@ int main(int argc, char** argv) {
                           sat_valid);
 
         // 终端输出：首个成功历元与最后成功历元的快照（便于确认是否全程稳定）。
-        if (cfg_mgr.config().terminal_output && has_first_ok && last_ok_pos.size() == 3) {
+        if (cfg.terminalOutputEnabled() && has_first_ok && last_ok_pos.size() == 3) {
             std::cout << "FIRST_OK_TOW=" << first_ok_tow << " LAST_OK_TOW=" << last_ok_tow << std::endl;
             std::cout << "LAST_OK_XYZ=" << last_ok_pos[0] << "," << last_ok_pos[1] << "," << last_ok_pos[2]
                       << " LAST_OK_CLK(m)=" << last_ok_clk_m << std::endl;
         }
 
         // 终端输出：输出目录提示（便于脚本或人工定位输出文件位置）。
-        if (cfg_mgr.config().terminal_output && cfg_mgr.config().file_output) {
-            std::cout << "OUTPUT_DIR=" << cfg_mgr.config().output_dir << std::endl;
+        if (cfg.terminalOutputEnabled() && cfg.fileOutputEnabled()) {
+            std::cout << "OUTPUT_DIR=" << cfg.outputDir() << std::endl;
         }
 
         return 0;

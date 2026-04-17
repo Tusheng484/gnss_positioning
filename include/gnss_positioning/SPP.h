@@ -251,6 +251,7 @@ private:
         XYZ los;              ///< 单位视线向量
         double rho;           ///< 几何距离 (m)
         double tropo_m;        ///< 对流层延迟 (m)
+        double iono_m = 0.0;   ///< 电离层延迟 (m)
         double P_corr;         ///< 观测伪距 + c*dt_s (m)
         bool valid;           ///< 中间量是否有效
 

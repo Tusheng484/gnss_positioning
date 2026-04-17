@@ -573,6 +573,7 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
         sc.los = los;
         sc.rho = rho;
         sc.tropo_m = tropo;
+        sc.iono_m = iono;
         sc.P_corr = P_corr;
         sc.valid = true;
 
@@ -618,7 +619,7 @@ bool SPP::solveLeastSquares(const std::vector<SatCalc>& sats,
         const auto& s = sats[i];
         const double bias_m = sol_.clk_gps_m + ((s.system == GnssSystem::BDS) ? sol_.isb_bds_m : 0.0);
 
-        y(i) = s.P_corr - (s.rho + s.tropo_m + bias_m);
+        y(i) = s.P_corr - (s.rho + s.tropo_m + s.iono_m + bias_m);
         H(i, 0) = -s.los.x;
         H(i, 1) = -s.los.y;
         H(i, 2) = -s.los.z;
