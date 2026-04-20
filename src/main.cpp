@@ -32,6 +32,7 @@
 #include <gnss_positioning/Logging.h>
 #include <gnss_positioning/NavMath.h>
 #include <gnss_positioning/NovatelDecoder.h>
+#include <gnss_positioning/SocketStream.h>
 #include <gnss_positioning/SPP.h>
 #include <gnss_positioning/SatPosCalc.h>
 #include <gnss_positioning/ErrorCorrection.h>
@@ -141,7 +142,12 @@ void LogEffectiveConfig(const gnss::Config& cfg) {
     const auto& ref = cfg.referenceEcef();
 
     LOG(INFO) << "CONFIG_PATH=" << cfg.sourcePath();
-    LOG(INFO) << "INPUT_PATH=" << cfg.inputPath();
+    LOG(INFO) << "INPUT_MODE=" << gnss::ToString(cfg.inputMode());
+    if (cfg.fileInputEnabled()) {
+        LOG(INFO) << "INPUT_PATH=" << cfg.inputPath();
+    } else {
+        LOG(INFO) << "NET_ENDPOINT=" << cfg.netIp() << ":" << cfg.netPort();
+    }
     LOG(INFO) << "OUTPUT_DIR=" << cfg.outputDir();
     LOG(INFO) << "TERMINAL_OUTPUT=" << (cfg.terminalOutputEnabled() ? "true" : "false");
     LOG(INFO) << "FILE_OUTPUT=" << (cfg.fileOutputEnabled() ? "true" : "false");
@@ -189,7 +195,12 @@ public:
         if (!enabled_) return;
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "GNSS SPP 定位程序" << std::endl;
-        std::cout << "INPUT=" << cfg.inputPath() << std::endl;
+        std::cout << "INPUT_MODE=" << gnss::ToString(cfg.inputMode()) << std::endl;
+        if (cfg.fileInputEnabled()) {
+            std::cout << "INPUT=" << cfg.inputPath() << std::endl;
+        } else {
+            std::cout << "NET_ENDPOINT=" << cfg.netIp() << ":" << cfg.netPort() << std::endl;
+        }
         std::cout << "OUTPUT_DIR=" << cfg.outputDir() << std::endl;
         std::cout << "SPP_MODE=" << gnss::ToString(cfg.sppOptions().frequency_mode) << std::endl;
         std::cout << "CONFIG=" << cfg.sourcePath() << std::endl;
@@ -226,7 +237,7 @@ public:
 
     /**
      * @brief 输出全流程统计摘要（用于处理量级与异常跳过原因分析）
-     * @param total_bytes `uint32_t` 类型累计读取字节数，取值范围 `[0, 2^32-1]`
+     * @param total_bytes `uint64_t` 类型累计读取字节数，适用于长时间实时流统计
      * @param range_frames `uint32_t` 类型 RANGE 历元数量，消息 ID 为 43
      * @param gps_eph `uint32_t` 类型 GPS 星历数量，消息 ID 为 7
      * @param bds_eph `uint32_t` 类型 BDS 星历数量，消息 ID 为 1696
@@ -242,7 +253,7 @@ public:
      * @return 无
      * @exception 本函数不主动抛出异常；若输出流失败，则由流状态记录
      */
-    void printSummary(uint32_t total_bytes,
+    void printSummary(uint64_t total_bytes,
                       uint32_t range_frames,
                       uint32_t gps_eph,
                       uint32_t bds_eph,
@@ -353,6 +364,12 @@ public:
             obs_file_.setf(std::ios::fixed, std::ios::floatfield);
             obs_file_ << std::setprecision(3);
             obs_file_ << "WEEK TOW SYS PRN FREQIDX P(m) L(cycle) D(Hz) SNR(dBHz)" << std::endl;
+        }
+
+        if (cfg_.networkInputEnabled()) {
+            raw_stream_path_ = (std::filesystem::path(cfg_.outputDir()) / "realtime_input.log").string();
+            raw_stream_file_.open(raw_stream_path_, std::ios::binary);
+            if (!raw_stream_file_.is_open()) return false;
         }
 
         return true;
@@ -571,6 +588,19 @@ public:
     }
 
     /**
+     * @brief 写入网口原始二进制流（realtime_input.log）
+     * @param data 原始字节数据首地址
+     * @param size 待写入字节数
+     * @return 无
+     * @exception 本函数不主动抛出异常；若未启用落盘或文件未打开则直接返回
+     */
+    void writeRawStream(const uint8_t* data, std::size_t size) {
+        if (!cfg_.fileOutputEnabled() || !cfg_.networkInputEnabled()) return;
+        if (!raw_stream_file_.is_open() || data == nullptr || size == 0) return;
+        raw_stream_file_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    }
+
+    /**
      * @brief 获取 spp_solution.txt 输出路径（若未启用则为空字符串）
      * @return `const std::string&` 类型输出路径引用；未启用时可能为空字符串
      * @exception 本函数不主动抛出异常
@@ -596,12 +626,14 @@ private:
     std::ofstream gps_eph_file_;
     std::ofstream bds_eph_file_;
     std::ofstream obs_file_;
+    std::ofstream raw_stream_file_;
 
     std::string spp_path_;
     std::string sat_path_;
     std::string gps_eph_path_;
     std::string bds_eph_path_;
     std::string obs_path_;
+    std::string raw_stream_path_;
 };
 
 /**
@@ -789,6 +821,103 @@ private:
     }
 };
 
+constexpr std::size_t kInputChunkBytes = 4096;
+
+/**
+ * @brief 单次输入读取结果
+ */
+struct InputChunk {
+    std::size_t size = 0;
+    bool timed_out = false;
+    bool source_closed = false;
+};
+
+/**
+ * @brief 统一封装文件/网口两种输入方式
+ *
+ * 设计目的：
+ * - 让主循环只关心“拿到一批字节”；
+ * - 保持 OEM 流式解码与后续 SPP 逻辑完全复用。
+ */
+class InputReader {
+public:
+    explicit InputReader(const gnss::Config& cfg) : cfg_(cfg) {}
+
+    /**
+     * @brief 打开配置指定的输入源
+     * @param error_message 失败时写入错误描述
+     * @return true 表示打开成功
+     */
+    bool open(std::string& error_message) {
+        error_message.clear();
+        if (cfg_.fileInputEnabled()) {
+            in_file_.open(cfg_.inputPath(), std::ios::binary);
+            if (!in_file_.is_open()) {
+                error_message = "无法打开输入文件: " + cfg_.inputPath();
+                return false;
+            }
+            return true;
+        }
+        return socket_.open(cfg_.netIp(), cfg_.netPort(), 1000, error_message);
+    }
+
+    /**
+     * @brief 从当前输入源读取一块字节流
+     * @param buffer 输出缓冲区
+     * @param chunk 输出的读块状态
+     * @param error_message 失败时写入错误描述
+     * @return true 表示本次调用成功返回（即使超时或已到流结束）
+     */
+    bool read(std::array<uint8_t, kInputChunkBytes>& buffer,
+              InputChunk& chunk,
+              std::string& error_message) {
+        chunk = {};
+        error_message.clear();
+
+        if (cfg_.fileInputEnabled()) {
+            if (!in_file_.is_open()) {
+                error_message = "输入文件尚未打开: " + cfg_.inputPath();
+                return false;
+            }
+
+            in_file_.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize count = in_file_.gcount();
+            if (count > 0) {
+                chunk.size = static_cast<std::size_t>(count);
+                return true;
+            }
+            if (in_file_.eof()) {
+                chunk.source_closed = true;
+                return true;
+            }
+
+            error_message = "读取输入文件失败: " + cfg_.inputPath();
+            return false;
+        }
+
+        std::size_t bytes_received = 0;
+        const gnss::SocketReadStatus status = socket_.receive(buffer.data(), buffer.size(), bytes_received, error_message);
+        if (status == gnss::SocketReadStatus::OK) {
+            chunk.size = bytes_received;
+            return true;
+        }
+        if (status == gnss::SocketReadStatus::TIMEOUT) {
+            chunk.timed_out = true;
+            return true;
+        }
+        if (status == gnss::SocketReadStatus::CLOSED) {
+            chunk.source_closed = true;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    const gnss::Config& cfg_;
+    std::ifstream in_file_;
+    gnss::SocketClient socket_;
+};
+
 } // namespace
 
 /**
@@ -800,7 +929,7 @@ private:
  *
  * 主流程（按数据流驱动组织）：
  * 1) 读取命令行并一次性加载配置文件
- * 2) 初始化终端输出与输出文件
+ * 2) 初始化终端输出、输入源与输出文件
  * 3) 流式读取 OEM 二进制数据，解码消息帧
  * 4) 星历消息：缓存并落盘
  * 5) 观测消息：落盘、可选卫星状态输出、可选 SPP 解算输出
@@ -816,10 +945,11 @@ int main(int argc, char** argv) {
         term.setEnabled(cfg.terminalOutputEnabled());
         term.printStartup(cfg);
 
-        // 打开输入文件（OEM 二进制日志）。
-        std::ifstream in_file(cfg.inputPath(), std::ios::binary);
-        if (!in_file.is_open()) {
-            std::cerr << "[ERROR] 无法打开输入文件: " << cfg.inputPath() << std::endl;
+        // 打开输入源：支持已有 OEM 日志文件与网口实时二进制流两种模式。
+        InputReader input(cfg);
+        std::string input_error;
+        if (!input.open(input_error)) {
+            std::cerr << "[ERROR] " << input_error << std::endl;
             return 1;
         }
 
@@ -839,7 +969,7 @@ int main(int argc, char** argv) {
         std::map<uint32_t, gnss::Ephemeris> eph_store;
 
         // 统计变量：用于终端输出 SUMMARY，与性能无关，生命周期贯穿 main()。
-        uint32_t total_bytes = 0;
+        uint64_t total_bytes = 0;
         uint32_t range_frames = 0;
         uint32_t gps_eph_count = 0;
         uint32_t bds_eph_count = 0;
@@ -859,106 +989,120 @@ int main(int argc, char** argv) {
         std::vector<double> last_ok_pos;
         double last_ok_clk_m = 0.0;
 
-        // 主循环：逐字节喂给解码器，解码出完整消息帧后按消息类型分发处理。
-        uint8_t byte = 0;
-        while (in_file.read(reinterpret_cast<char*>(&byte), 1)) {
-            total_bytes++;
-            if (!decoder.inputData(byte)) continue;
-
-            uint16_t msg_id = decoder.getMsgId();
-
-            // 消息 ID=7：GPSEPHEM（GPS 广播星历）。
-            if (msg_id == 7) {
-                const auto& gps_eph = decoder.getGpsEphem();
-                if (gps_eph.prn >= 1 && gps_eph.prn <= 32) {
-                    eph_store[MakeKey(gnss::GnssSystem::GPS, gps_eph.prn)] = gnss::ConvertFromGpsEphem(gps_eph);
-                    gps_eph_count++;
-                    files.writeGpsEphem(gps_eph);
-                }
-                continue;
+        // 主循环：按块读取原始字节流，再逐字节喂给解码器完成完整消息拼接、CRC 校验与分发。
+        std::array<uint8_t, kInputChunkBytes> chunk_buffer{};
+        while (true) {
+            InputChunk chunk;
+            std::string read_error;
+            if (!input.read(chunk_buffer, chunk, read_error)) {
+                std::cerr << "[ERROR] " << read_error << std::endl;
+                return 1;
             }
+            if (chunk.timed_out) continue;
+            if (chunk.source_closed) break;
 
-            // 消息 ID=1696：BDSEPHEMERIS（BDS 广播星历）。
-            if (msg_id == 1696) {
-                const auto& bds_eph = decoder.getBdsEphem();
-                if (bds_eph.prn >= 1 && bds_eph.prn <= 63) {
-                    eph_store[MakeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = gnss::ConvertFromBdsEphem(bds_eph);
-                    bds_eph_count++;
-                    files.writeBdsEphem(bds_eph);
-                }
-                continue;
-            }
+            total_bytes += chunk.size;
+            files.writeRawStream(chunk_buffer.data(), chunk.size);
 
-            // 消息 ID=43：RANGE（观测数据）。其他消息类型在当前主程序中忽略。
-            if (msg_id != 43) continue;
+            for (std::size_t i = 0; i < chunk.size; ++i) {
+                const uint8_t byte = chunk_buffer[i];
+                if (!decoder.inputData(byte)) continue;
 
-            range_frames++;
-            double tow = decoder.getTow();
-            const auto& obs_list = decoder.getObsData();
-            files.writeObs(decoder.getWeek(), tow, obs_list);
+                uint16_t msg_id = decoder.getMsgId();
 
-            // 卫星状态文件按历元写入两行时间头，便于后处理按历元分段解析。
-            gnss::GPSTIME gps_time;
-            gps_time.Week = decoder.getWeek();
-            gps_time.SecOfWeek = tow;
-            files.writeSatEpochHeader(gps_time);
-
-            // 卫星状态输出：对本历元出现的（GPS/BDS、freqIdx=0）卫星，若能匹配到星历则计算状态并写入。
-            if (cfg.satStateEnabled() && cfg.fileOutputEnabled() && cfg.fileSatStatesEnabled()) {
-                std::map<uint32_t, gnss::ObsData> uniq_obs;
-                for (const auto& obs : obs_list) {
-                    if (obs.system != gnss::GnssSystem::GPS && obs.system != gnss::GnssSystem::BDS) continue;
-                    if (obs.freqIdx != 0) continue;
-                    uniq_obs[MakeKey(obs.system, obs.prn)] = obs;
-                }
-
-                for (const auto& kv : uniq_obs) {
-                    const auto& obs = kv.second;
-                    sat_total++;
-                    auto it = eph_store.find(MakeKey(obs.system, obs.prn));
-                    if (it == eph_store.end()) {
-                        sat_no_eph++;
-                        continue;
+                // 消息 ID=7：GPSEPHEM（GPS 广播星历）。
+                if (msg_id == 7) {
+                    const auto& gps_eph = decoder.getGpsEphem();
+                    if (gps_eph.prn >= 1 && gps_eph.prn <= 32) {
+                        eph_store[MakeKey(gnss::GnssSystem::GPS, gps_eph.prn)] = gnss::ConvertFromGpsEphem(gps_eph);
+                        gps_eph_count++;
+                        files.writeGpsEphem(gps_eph);
                     }
-                    gnss::SatState st;
-                    if (!SatStateCore::computeAtTow(obs.system, obs.prn, tow, it->second, st)) continue;
-                    sat_ok++;
-                    if (st.valid) sat_valid++;
-                    files.writeSatStateLine(obs.system, obs.prn, st);
+                    continue;
                 }
-            }
 
-            // SPP 解算开关：禁用时跳过定位，仅完成解析与落盘。
-            if (!cfg.sppEnabled()) continue;
-
-            // 将当前缓存的全部星历转为线性列表（SPP 内部自行按 sys/prn 匹配）。
-            std::vector<gnss::Ephemeris> eph_list;
-            eph_list.reserve(eph_store.size());
-            for (const auto& kv : eph_store) eph_list.push_back(kv.second);
-
-            // 单历元 SPP 解算：输出 report（用于终端摘要与落盘）。
-            gnss::SppEpochReport report;
-            bool ok = spp.compute(tow, obs_list, eph_list, report);
-            term.printEpoch(gps_time, report, ok);
-
-            // 统计与落盘：attempted 表示满足基本条件并进入解算流程。
-            if (report.attempted) solve_attempt++;
-            if (ok) spp_ok++;
-            else spp_fail++;
-            if (!report.attempted && (report.eph_g + report.eph_b) == 0) skip_no_eph++;
-            if (!report.attempted && (report.eph_g + report.eph_b) > 0) skip_low_match++;
-
-            files.writeSppReport(gps_time, report);
-
-            // 记录首个成功历元与最近成功历元（用于终端快速定位结果范围）。
-            if (ok) {
-                if (!has_first_ok) {
-                    has_first_ok = true;
-                    first_ok_tow = report.tow_gpst;
+                // 消息 ID=1696：BDSEPHEMERIS（BDS 广播星历）。
+                if (msg_id == 1696) {
+                    const auto& bds_eph = decoder.getBdsEphem();
+                    if (bds_eph.prn >= 1 && bds_eph.prn <= 63) {
+                        eph_store[MakeKey(gnss::GnssSystem::BDS, bds_eph.prn)] = gnss::ConvertFromBdsEphem(bds_eph);
+                        bds_eph_count++;
+                        files.writeBdsEphem(bds_eph);
+                    }
+                    continue;
                 }
-                last_ok_tow = report.tow_gpst;
-                last_ok_pos = spp.lastPosition();
-                last_ok_clk_m = report.clk_gps_m;
+
+                // 消息 ID=43：RANGE（观测数据）。其他消息类型在当前主程序中忽略。
+                if (msg_id != 43) continue;
+
+                range_frames++;
+                double tow = decoder.getTow();
+                const auto& obs_list = decoder.getObsData();
+                files.writeObs(decoder.getWeek(), tow, obs_list);
+
+                // 卫星状态文件按历元写入两行时间头，便于后处理按历元分段解析。
+                gnss::GPSTIME gps_time;
+                gps_time.Week = decoder.getWeek();
+                gps_time.SecOfWeek = tow;
+                files.writeSatEpochHeader(gps_time);
+
+                // 卫星状态输出：对本历元出现的（GPS/BDS、freqIdx=0）卫星，若能匹配到星历则计算状态并写入。
+                if (cfg.satStateEnabled() && cfg.fileOutputEnabled() && cfg.fileSatStatesEnabled()) {
+                    std::map<uint32_t, gnss::ObsData> uniq_obs;
+                    for (const auto& obs : obs_list) {
+                        if (obs.system != gnss::GnssSystem::GPS && obs.system != gnss::GnssSystem::BDS) continue;
+                        if (obs.freqIdx != 0) continue;
+                        uniq_obs[MakeKey(obs.system, obs.prn)] = obs;
+                    }
+
+                    for (const auto& kv : uniq_obs) {
+                        const auto& obs = kv.second;
+                        sat_total++;
+                        auto it = eph_store.find(MakeKey(obs.system, obs.prn));
+                        if (it == eph_store.end()) {
+                            sat_no_eph++;
+                            continue;
+                        }
+                        gnss::SatState st;
+                        if (!SatStateCore::computeAtTow(obs.system, obs.prn, tow, it->second, st)) continue;
+                        sat_ok++;
+                        if (st.valid) sat_valid++;
+                        files.writeSatStateLine(obs.system, obs.prn, st);
+                    }
+                }
+
+                // SPP 解算开关：禁用时跳过定位，仅完成解析与落盘。
+                if (!cfg.sppEnabled()) continue;
+
+                // 将当前缓存的全部星历转为线性列表（SPP 内部自行按 sys/prn 匹配）。
+                std::vector<gnss::Ephemeris> eph_list;
+                eph_list.reserve(eph_store.size());
+                for (const auto& kv : eph_store) eph_list.push_back(kv.second);
+
+                // 单历元 SPP 解算：输出 report（用于终端摘要与落盘）。
+                gnss::SppEpochReport report;
+                bool ok = spp.compute(tow, obs_list, eph_list, report);
+                term.printEpoch(gps_time, report, ok);
+
+                // 统计与落盘：attempted 表示满足基本条件并进入解算流程。
+                if (report.attempted) solve_attempt++;
+                if (ok) spp_ok++;
+                else spp_fail++;
+                if (!report.attempted && (report.eph_g + report.eph_b) == 0) skip_no_eph++;
+                if (!report.attempted && (report.eph_g + report.eph_b) > 0) skip_low_match++;
+
+                files.writeSppReport(gps_time, report);
+
+                // 记录首个成功历元与最近成功历元（用于终端快速定位结果范围）。
+                if (ok) {
+                    if (!has_first_ok) {
+                        has_first_ok = true;
+                        first_ok_tow = report.tow_gpst;
+                    }
+                    last_ok_tow = report.tow_gpst;
+                    last_ok_pos = spp.lastPosition();
+                    last_ok_clk_m = report.clk_gps_m;
+                }
             }
         }
 

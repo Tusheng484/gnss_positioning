@@ -116,6 +116,22 @@ double ParseDouble(const std::string& text) {
 }
 
 /**
+ * @brief 解析无符号 16 位整数
+ * @param text 输入字符串，要求可被 `std::stoul` 正确解析
+ * @return 解析后的端口值
+ * @exception std::invalid_argument 当输入为空、包含非法字符或越界时抛出
+ */
+unsigned short ParseUShort(const std::string& text) {
+    const std::string value = Unquote(text);
+    std::size_t consumed = 0;
+    const unsigned long out = std::stoul(value, &consumed);
+    if (consumed != value.size() || out > 65535UL) {
+        throw std::invalid_argument("Config parse failed: invalid uint16 value '" + text + "'.");
+    }
+    return static_cast<unsigned short>(out);
+}
+
+/**
  * @brief 解析长度为 4 的浮点数组
  * @param text 输入字符串，格式示例：`[1, 2, 3, 4]`
  * @return 四元素数组
@@ -172,6 +188,17 @@ bool AllFinite(const std::array<double, 4>& values) {
 }
 
 } // namespace
+
+const char* ToString(InputMode mode) {
+    switch (mode) {
+    case InputMode::FILE:
+        return "FILE";
+    case InputMode::NETWORK:
+        return "NETWORK";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 const char* ToString(SppFrequencyMode mode) {
     switch (mode) {
@@ -237,7 +264,18 @@ Config Config::LoadFromYaml(const std::string& file_path) {
         if (!full_key.empty()) full_key += '.';
         full_key += key;
 
-        if (full_key == "io.input_path") cfg.input_path_ = Unquote(value);
+        if (full_key == "io.input_mode") {
+            const std::string mode = ToLower(Unquote(value));
+            if (mode == "file" || mode == "log") {
+                cfg.input_mode_ = InputMode::FILE;
+            } else if (mode == "network" || mode == "net" || mode == "socket") {
+                cfg.input_mode_ = InputMode::NETWORK;
+            } else {
+                throw std::invalid_argument("Config parse failed: unsupported io.input_mode '" + value + "'.");
+            }
+        } else if (full_key == "io.input_path") cfg.input_path_ = Unquote(value);
+        else if (full_key == "io.net_ip") cfg.net_ip_ = Unquote(value);
+        else if (full_key == "io.net_port") cfg.net_port_ = ParseUShort(value);
         else if (full_key == "io.output_dir") cfg.output_dir_ = Unquote(value);
         else if (full_key == "output.terminal_output") cfg.terminal_output_ = ParseBool(value);
         else if (full_key == "output.file_output") cfg.file_output_ = ParseBool(value);
@@ -280,8 +318,14 @@ Config Config::LoadFromYaml(const std::string& file_path) {
 }
 
 void Config::validate() const {
-    if (input_path_.empty()) {
-        throw std::invalid_argument("Config validation failed: io.input_path must not be empty.");
+    if (fileInputEnabled() && input_path_.empty()) {
+        throw std::invalid_argument("Config validation failed: io.input_path must not be empty when io.input_mode=FILE.");
+    }
+    if (networkInputEnabled() && net_ip_.empty()) {
+        throw std::invalid_argument("Config validation failed: io.net_ip must not be empty when io.input_mode=NETWORK.");
+    }
+    if (networkInputEnabled() && net_port_ == 0) {
+        throw std::invalid_argument("Config validation failed: io.net_port must be within [1, 65535] when io.input_mode=NETWORK.");
     }
     if (file_output_ && output_dir_.empty()) {
         throw std::invalid_argument("Config validation failed: io.output_dir must not be empty when output.file_output=true.");

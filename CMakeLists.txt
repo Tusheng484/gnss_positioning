@@ -13,6 +13,7 @@ add_library(gnss_positioning_lib
     src/NovatelDecoder.cpp
     src/SPP.cpp
     src/SatPosCalc.cpp
+    src/SocketStream.cpp
     src/ErrorCorrection.cpp
 )
 # public include paths for library; also expose third_party/eigen for users
@@ -33,6 +34,10 @@ target_include_directories(gnss_positioning
 target_link_libraries(gnss_positioning
     PRIVATE gnss_positioning_lib
 )
+
+if (WIN32)
+    target_link_libraries(gnss_positioning_lib PUBLIC ws2_32)
+endif()
 
 set_target_properties(gnss_positioning PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin

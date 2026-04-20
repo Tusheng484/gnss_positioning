@@ -1,9 +1,12 @@
 io:
+  input_mode: network
   input_path: D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log
-  output_dir: D:/gnss_positioning/output/Novatel OEM7 Data/01/
+  net_ip: 8.148.22.229
+  net_port: 7003
+  output_dir: D:/gnss_positioning/output/network
 
 output:
-  terminal_output: false
+  terminal_output: true
   file_output: true
   file_spp_solution: true
   file_sat_states: true

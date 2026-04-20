@@ -19,6 +19,25 @@
 namespace gnss {
 
 /**
+ * @brief 输入源模式
+ *
+ * 说明：
+ * - `FILE`：从已有 OEM 二进制日志文件读取；
+ * - `NETWORK`：从网口实时接收 OEM 二进制流。
+ */
+enum class InputMode {
+    FILE,
+    NETWORK
+};
+
+/**
+ * @brief 将输入源模式转换为可读字符串
+ * @param mode 输入源模式枚举值
+ * @return 对应的常量字符串
+ */
+const char* ToString(InputMode mode);
+
+/**
  * @brief SPP 频率模式
  *
  * 说明：
@@ -113,10 +132,40 @@ public:
     const std::string& sourcePath() const { return source_path_; }
 
     /**
+     * @brief 获取输入源模式
+     * @return 输入源模式枚举值
+     */
+    InputMode inputMode() const { return input_mode_; }
+
+    /**
      * @brief 获取输入日志文件路径
      * @return 输入文件路径字符串引用
      */
     const std::string& inputPath() const { return input_path_; }
+
+    /**
+     * @brief 获取网口 IP 地址
+     * @return 网口 IP 字符串引用
+     */
+    const std::string& netIp() const { return net_ip_; }
+
+    /**
+     * @brief 获取网口端口
+     * @return 网口端口号
+     */
+    unsigned short netPort() const { return net_port_; }
+
+    /**
+     * @brief 判断是否启用文件输入
+     * @return true 表示从日志文件读取；false 表示不是文件模式
+     */
+    bool fileInputEnabled() const { return input_mode_ == InputMode::FILE; }
+
+    /**
+     * @brief 判断是否启用网口输入
+     * @return true 表示从网口实时读取；false 表示不是网口模式
+     */
+    bool networkInputEnabled() const { return input_mode_ == InputMode::NETWORK; }
 
     /**
      * @brief 获取输出目录路径
@@ -192,7 +241,10 @@ private:
     void validate() const;
 
     std::string source_path_;
+    InputMode input_mode_ = InputMode::FILE;
     std::string input_path_;
+    std::string net_ip_;
+    unsigned short net_port_ = 0;
     std::string output_dir_;
     bool terminal_output_ = false;
     bool file_output_ = true;
