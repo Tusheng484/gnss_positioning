@@ -2,7 +2,12 @@
  * @file SPP.h
  * @brief 标准单点定位（SPP）核心接口与数据结构声明
  * @author Jiaoyang Wu
- * @date 2026-03-25
+ * @date 2026-04-20
+ *
+ * 单位约定：
+ * - 角度：弧度 (rad)
+ * - 距离：米 (m)
+ * - 时间：秒 (s)
  */
 
 #ifndef SPP_H

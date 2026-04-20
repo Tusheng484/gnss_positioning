@@ -1,3 +1,15 @@
+/**
+ * @file Config.h
+ * @brief SPP 程序集中式参数配置模块：定义配置数据结构、只读访问接口与加载入口声明
+ * @author Jiaoyang Wu
+ * @date 2026-04-20
+ *
+ * 单位约定：
+ * - 角度：度 (deg)
+ * - 距离：米 (m)
+ * - 时间：秒 (s)
+ */
+
 #ifndef GNSS_POSITIONING_CONFIG_H
 #define GNSS_POSITIONING_CONFIG_H
 

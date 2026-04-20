@@ -15,20 +15,20 @@ runtime:
   enable_sat_state: true
 
 spp:
-  frequency_mode: single_freq_klobuchar
+  frequency_mode: DUAL_FREQ_IF
   enable_tropo: true
   enable_tgd: true
-  enable_klobuchar_model: true
+  enable_klobuchar_model: false
   elev_mask_deg: 10.0
   snr_mask_dbhz: 30.0
   gps_klobuchar:
-    enabled: true
-    alpha: [1.2107e-08, -7.4506e-09, -1.1921e-07, 5.9605e-08]
-    beta: [9.8300e+04, -8.1920e+04, -1.9660e+05, 4.5880e+05]
+    enabled: false
+    alpha: [0.0, 0.0, 0.0, 0.0]
+    beta: [0.0, 0.0, 0.0, 0.0]
   bds_klobuchar:
-    enabled: true
-    alpha: [1.2110e-08, -7.4510e-09, -1.1920e-07, 5.9600e-08]
-    beta: [9.8300e+04, -8.1920e+04, -1.9660e+05, 4.5880e+05]
+    enabled: false
+    alpha: [0.0, 0.0, 0.0, 0.0]
+    beta: [0.0, 0.0, 0.0, 0.0]
 
 reference_ecef:
   x: -2267804.5260

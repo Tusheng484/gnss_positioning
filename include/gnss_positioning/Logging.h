@@ -1,3 +1,15 @@
+/**
+ * @file Logging.h
+ * @brief 轻量级日志模块：提供 `LOG(INFO) << ...` 风格输出接口，供主流程参数回显与运行日志使用
+ * @author Jiaoyang Wu
+ * @date 2026-04-20
+ *
+ * 使用约定：
+ * - 该模块仅依赖 C++ 标准库；
+ * - 输出默认写入标准输出流；
+ * - 日志级别通过宏参数传入（如 INFO/WARN/ERROR）。
+ */
+
 #ifndef GNSS_POSITIONING_LOGGING_H
 #define GNSS_POSITIONING_LOGGING_H
 

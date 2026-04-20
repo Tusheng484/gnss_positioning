@@ -2,7 +2,12 @@
  * @file SPP.cpp
  * @brief 标准单点定位（SPP）实现：观测预处理、广播星历解算与最小二乘迭代
  * @author Jiaoyang Wu
- * @date 2026-03-25
+ * @date 2026-04-20
+ *
+ * 单位约定：
+ * - 角度：弧度 (rad)
+ * - 距离：米 (m)
+ * - 时间：秒 (s)
  */
 
 #include "gnss_positioning/SPP.h"

@@ -1,3 +1,15 @@
+/**
+ * @file Config.cpp
+ * @brief SPP 程序集中式参数配置模块实现：YAML 读取、字段解析、范围校验与依赖关系校验
+ * @author Jiaoyang Wu
+ * @date 2026-04-20
+ *
+ * 单位约定：
+ * - 角度：度 (deg)
+ * - 距离：米 (m)
+ * - 时间：秒 (s)
+ */
+
 #include "gnss_positioning/Config.h"
 
 #include <algorithm>
