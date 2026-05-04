@@ -94,6 +94,20 @@ struct SppOptions {
 };
 
 /**
+ * @brief GNSS 系统选择配置
+ */
+struct GnssSystemOptions {
+    bool enable_gps = true;
+    bool enable_bds = true;
+
+    /**
+     * @brief 判断是否至少启用了一个当前已接入的导航系统
+     * @return true 表示 GPS/BDS 至少有一个启用
+     */
+    bool anyEnabled() const { return enable_gps || enable_bds; }
+};
+
+/**
  * @brief 接收机参考坐标配置
  */
 struct ReferenceEcef {
@@ -228,6 +242,12 @@ public:
     const SppOptions& sppOptions() const { return spp_options_; }
 
     /**
+     * @brief 获取 GNSS 系统选择配置
+     * @return 系统选择结构体常量引用
+     */
+    const GnssSystemOptions& gnssSystems() const { return gnss_systems_; }
+
+    /**
      * @brief 获取参考 ECEF 坐标
      * @return 参考坐标结构体常量引用
      */
@@ -254,6 +274,7 @@ private:
     bool file_observations_ = true;
     bool enable_spp_ = true;
     bool enable_sat_state_ = true;
+    GnssSystemOptions gnss_systems_;
     SppOptions spp_options_;
     ReferenceEcef reference_ecef_;
 };

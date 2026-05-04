@@ -83,7 +83,7 @@ def print_other_comparison(df_cmp):
 
 def main():
     df_ref = load_solution('D:\\gnss_positioning\\参考数据\\NovatelOEM20211114-01.pos')
-    df_sol = load_solution('D:\\gnss_positioning\\output\\Novatel OEM7 Data\\01\\spp_solution.txt')
+    df_sol = load_solution('D:\\gnss_positioning\\output\\network\\spp_solution.txt')
 
     # 接收机位置误差直接使用结果文件内置参考坐标。
     position_columns = [

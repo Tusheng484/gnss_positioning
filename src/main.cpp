@@ -128,6 +128,52 @@ std::string FormatArray4(const std::array<double, 4>& values) {
 }
 
 /**
+ * @brief 判断指定导航系统是否在当前配置下启用
+ * @param systems `gnss::GnssSystemOptions` 类型系统开关配置
+ * @param sys `gnss::GnssSystem` 类型卫星系统枚举
+ * @return `true` 表示允许该系统进入后续卫星状态/SPP 处理链路
+ */
+bool IsSystemEnabled(const gnss::GnssSystemOptions& systems, gnss::GnssSystem sys) {
+    if (sys == gnss::GnssSystem::GPS) return systems.enable_gps;
+    if (sys == gnss::GnssSystem::BDS) return systems.enable_bds;
+    return false;
+}
+
+/**
+ * @brief 过滤当前配置允许进入处理链路的观测
+ * @param obs_list 当前历元原始观测列表
+ * @param systems `gnss::GnssSystemOptions` 类型系统开关配置
+ * @return 仅包含启用系统观测的线性列表
+ */
+std::vector<gnss::ObsData> FilterEnabledObservations(const std::vector<gnss::ObsData>& obs_list,
+                                                     const gnss::GnssSystemOptions& systems) {
+    std::vector<gnss::ObsData> filtered;
+    filtered.reserve(obs_list.size());
+    for (const auto& obs : obs_list) {
+        if (!IsSystemEnabled(systems, obs.system)) continue;
+        filtered.push_back(obs);
+    }
+    return filtered;
+}
+
+/**
+ * @brief 收集当前配置允许参与解算的星历列表
+ * @param eph_store `std::map<uint32_t, gnss::Ephemeris>` 类型星历缓存
+ * @param systems `gnss::GnssSystemOptions` 类型系统开关配置
+ * @return 仅包含启用系统星历的线性列表
+ */
+std::vector<gnss::Ephemeris> CollectEnabledEphemeris(const std::map<uint32_t, gnss::Ephemeris>& eph_store,
+                                                     const gnss::GnssSystemOptions& systems) {
+    std::vector<gnss::Ephemeris> eph_list;
+    eph_list.reserve(eph_store.size());
+    for (const auto& kv : eph_store) {
+        if (!IsSystemEnabled(systems, kv.second.system)) continue;
+        eph_list.push_back(kv.second);
+    }
+    return eph_list;
+}
+
+/**
  * @brief 输出最终生效的关键配置参数
  * @param cfg `gnss::Config` 常量引用，表示已完成加载与校验的只读配置
  * @return 无
@@ -153,6 +199,8 @@ void LogEffectiveConfig(const gnss::Config& cfg) {
     LOG(INFO) << "FILE_OUTPUT=" << (cfg.fileOutputEnabled() ? "true" : "false");
     LOG(INFO) << "ENABLE_SPP=" << (cfg.sppEnabled() ? "true" : "false");
     LOG(INFO) << "ENABLE_SAT_STATE=" << (cfg.satStateEnabled() ? "true" : "false");
+    LOG(INFO) << "ENABLE_GPS=" << (cfg.gnssSystems().enable_gps ? "true" : "false");
+    LOG(INFO) << "ENABLE_BDS=" << (cfg.gnssSystems().enable_bds ? "true" : "false");
     LOG(INFO) << "SPP_MODE=" << gnss::ToString(spp.frequency_mode);
     LOG(INFO) << "SPP_ENABLE_TROPO=" << (spp.enable_tropo ? "true" : "false");
     LOG(INFO) << "SPP_ENABLE_TGD=" << (spp.enable_tgd ? "true" : "false");
@@ -231,6 +279,10 @@ public:
                   << " MATCH(G/B)=" << report.match_g << "/" << report.match_b
                   << " CLK(m)=" << report.clk_gps_m
                   << " ISB(m)=" << report.isb_bds_m
+                  << " ECEF-X/m=" << std::fixed << std::setprecision(4) << report.pos.x
+                  << " ECEF-Y/m=" << std::fixed << std::setprecision(4) << report.pos.y
+                  << " ECEF-Z/m=" << std::fixed << std::setprecision(4) << report.pos.z
+                  << std::fixed << std::setprecision(3)
                   << " PDOP=" << report.pdop
                   << std::endl;
     }
@@ -662,6 +714,7 @@ public:
      * @exception 本函数不主动抛出异常；若底层容器或字符串操作失败，则由标准库传播异常
      */
     void applyConfig(const gnss::Config& cfg) {
+        const auto& systems = cfg.gnssSystems();
         const auto& spp = cfg.sppOptions();
         solver_.setElevationMaskDeg(spp.elev_mask_deg);
         solver_.setSnrMaskDbHz(spp.snr_mask_dbhz);
@@ -669,6 +722,8 @@ public:
         solver_.setEnableTroposphere(spp.enable_tropo);
         solver_.setEnableKlobucharIono(spp.useKlobuchar());
         solver_.setEnableTgdCorrection(spp.enable_tgd);
+        solver_.setEnableGps(systems.enable_gps);
+        solver_.setEnableBds(systems.enable_bds);
 
         if (spp.gps_klobuchar.enabled) {
             solver_.setGpsKlobucharParams(spp.gps_klobuchar.alpha.data(),
@@ -987,8 +1042,7 @@ int main(int argc, char** argv) {
         double first_ok_tow = 0.0;
         double last_ok_tow = 0.0;
         std::vector<double> last_ok_pos;
-        double last_ok_clk_m = 0.0;
-
+        double last_ok_clk_m = 0.0; 
         // 主循环：按块读取原始字节流，再逐字节喂给解码器完成完整消息拼接、CRC 校验与分发。
         std::array<uint8_t, kInputChunkBytes> chunk_buffer{};
         while (true) {
@@ -1038,6 +1092,7 @@ int main(int argc, char** argv) {
                 range_frames++;
                 double tow = decoder.getTow();
                 const auto& obs_list = decoder.getObsData();
+                const auto filtered_obs_list = FilterEnabledObservations(obs_list, cfg.gnssSystems());
                 files.writeObs(decoder.getWeek(), tow, obs_list);
 
                 // 卫星状态文件按历元写入两行时间头，便于后处理按历元分段解析。
@@ -1049,8 +1104,7 @@ int main(int argc, char** argv) {
                 // 卫星状态输出：对本历元出现的（GPS/BDS、freqIdx=0）卫星，若能匹配到星历则计算状态并写入。
                 if (cfg.satStateEnabled() && cfg.fileOutputEnabled() && cfg.fileSatStatesEnabled()) {
                     std::map<uint32_t, gnss::ObsData> uniq_obs;
-                    for (const auto& obs : obs_list) {
-                        if (obs.system != gnss::GnssSystem::GPS && obs.system != gnss::GnssSystem::BDS) continue;
+                    for (const auto& obs : filtered_obs_list) {
                         if (obs.freqIdx != 0) continue;
                         uniq_obs[MakeKey(obs.system, obs.prn)] = obs;
                     }
@@ -1075,13 +1129,11 @@ int main(int argc, char** argv) {
                 if (!cfg.sppEnabled()) continue;
 
                 // 将当前缓存的全部星历转为线性列表（SPP 内部自行按 sys/prn 匹配）。
-                std::vector<gnss::Ephemeris> eph_list;
-                eph_list.reserve(eph_store.size());
-                for (const auto& kv : eph_store) eph_list.push_back(kv.second);
+                std::vector<gnss::Ephemeris> eph_list = CollectEnabledEphemeris(eph_store, cfg.gnssSystems());
 
                 // 单历元 SPP 解算：输出 report（用于终端摘要与落盘）。
                 gnss::SppEpochReport report;
-                bool ok = spp.compute(tow, obs_list, eph_list, report);
+                bool ok = spp.compute(tow, filtered_obs_list, eph_list, report);
                 term.printEpoch(gps_time, report, ok);
 
                 // 统计与落盘：attempted 表示满足基本条件并进入解算流程。

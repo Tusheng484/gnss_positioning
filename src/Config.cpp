@@ -285,6 +285,8 @@ Config Config::LoadFromYaml(const std::string& file_path) {
         else if (full_key == "output.file_observations") cfg.file_observations_ = ParseBool(value);
         else if (full_key == "runtime.enable_spp") cfg.enable_spp_ = ParseBool(value);
         else if (full_key == "runtime.enable_sat_state") cfg.enable_sat_state_ = ParseBool(value);
+        else if (full_key == "runtime.systems.gps") cfg.gnss_systems_.enable_gps = ParseBool(value);
+        else if (full_key == "runtime.systems.bds") cfg.gnss_systems_.enable_bds = ParseBool(value);
         else if (full_key == "spp.frequency_mode") {
             const std::string mode = ToLower(Unquote(value));
             if (mode == "single_freq_klobuchar" || mode == "single_freq" || mode == "single") {
@@ -330,6 +332,9 @@ void Config::validate() const {
     if (file_output_ && output_dir_.empty()) {
         throw std::invalid_argument("Config validation failed: io.output_dir must not be empty when output.file_output=true.");
     }
+    if (!gnss_systems_.anyEnabled()) {
+        throw std::invalid_argument("Config validation failed: at least one of runtime.systems.gps or runtime.systems.bds must be true.");
+    }
     if (!(spp_options_.elev_mask_deg >= 0.0 && spp_options_.elev_mask_deg <= 90.0)) {
         throw std::invalid_argument("Config validation failed: spp.elev_mask_deg must be within [0, 90] degrees.");
     }
@@ -348,6 +353,12 @@ void Config::validate() const {
     if (use_iono_free && (spp_options_.gps_klobuchar.enabled || spp_options_.bds_klobuchar.enabled)) {
         throw std::invalid_argument("Config validation failed: system Klobuchar parameters must be disabled when spp.frequency_mode=DUAL_FREQ_IF.");
     }
+    if (!gnss_systems_.enable_gps && spp_options_.gps_klobuchar.enabled) {
+        throw std::invalid_argument("Config validation failed: spp.gps_klobuchar.enabled must be false when runtime.systems.gps=false.");
+    }
+    if (!gnss_systems_.enable_bds && spp_options_.bds_klobuchar.enabled) {
+        throw std::invalid_argument("Config validation failed: spp.bds_klobuchar.enabled must be false when runtime.systems.bds=false.");
+    }
     if (!use_klobuchar && spp_options_.gps_klobuchar.enabled) {
         throw std::invalid_argument("Config validation failed: spp.gps_klobuchar.enabled must be false when Klobuchar mode is inactive.");
     }
@@ -356,6 +367,12 @@ void Config::validate() const {
     }
     if (use_klobuchar && !spp_options_.gps_klobuchar.enabled && !spp_options_.bds_klobuchar.enabled) {
         throw std::invalid_argument("Config validation failed: at least one of spp.gps_klobuchar.enabled or spp.bds_klobuchar.enabled must be true in SINGLE_FREQ_KLOBUCHAR mode.");
+    }
+    if (use_klobuchar && gnss_systems_.enable_gps && !gnss_systems_.enable_bds && !spp_options_.gps_klobuchar.enabled) {
+        throw std::invalid_argument("Config validation failed: spp.gps_klobuchar.enabled must be true when only GPS is enabled in SINGLE_FREQ_KLOBUCHAR mode.");
+    }
+    if (use_klobuchar && gnss_systems_.enable_bds && !gnss_systems_.enable_gps && !spp_options_.bds_klobuchar.enabled) {
+        throw std::invalid_argument("Config validation failed: spp.bds_klobuchar.enabled must be true when only BDS is enabled in SINGLE_FREQ_KLOBUCHAR mode.");
     }
     if (!spp_options_.gps_klobuchar.enabled &&
         (HasNonZero(spp_options_.gps_klobuchar.alpha) || HasNonZero(spp_options_.gps_klobuchar.beta))) {

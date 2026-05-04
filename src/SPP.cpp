@@ -255,6 +255,12 @@ Ephemeris SPP::normalizeEphemerisToGpSt(const Ephemeris& eph) const {
     return out;
 }
 
+bool SPP::isSystemEnabled(GnssSystem sys) const {
+    if (sys == GnssSystem::GPS) return enable_gps_;
+    if (sys == GnssSystem::BDS) return enable_bds_;
+    return false;
+}
+
 std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>& obsList) const {
     // 五步法-第1步：观测预处理
     // - 单星观测聚合：同一频点保留最高 SNR 的伪距，降低多路径与跟踪噪声风险
@@ -275,6 +281,7 @@ std::vector<SPP::ProcObs> SPP::preprocessObservations(const std::vector<ObsData>
 
     std::map<uint32_t, FreqObs> m;
     for (const auto& obs : obsList) {
+        if (!isSystemEnabled(obs.system)) continue;
         if (obs.pseudorange <= 0.0) continue;
         if (obs.snr < static_cast<float>(snr_mask_dbhz_)) continue;
         if (obs.freqIdx != 0 && obs.freqIdx != 1) continue;
@@ -482,6 +489,7 @@ bool SPP::buildObservationEquation(double t_rx_gpst,
     std::map<uint32_t, Ephemeris> ephMap;
     ephMap.clear();
     for (const auto& eph : ephList) {
+        if (!isSystemEnabled(eph.system)) continue;
         Ephemeris eph_gpst = normalizeEphemerisToGpSt(eph);
         ephMap[makeKey(eph_gpst.system, eph_gpst.prn)] = eph_gpst;
     }
@@ -1025,6 +1033,7 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
     int eph_g = 0;
     int eph_b = 0;
     for (const auto& eph : ephList) {
+        if (!isSystemEnabled(eph.system)) continue;
         uint32_t k = makeKeyLocal(eph.system, eph.prn);
         if (ephMap.emplace(k, eph).second) {
             if (eph.system == GnssSystem::GPS) eph_g++;
@@ -1037,6 +1046,7 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
     std::set<uint32_t> gpsObsPrn;
     std::set<uint32_t> bdsObsPrn;
     for (const auto& obs : obsList) {
+        if (!isSystemEnabled(obs.system)) continue;
         if (obs.pseudorange <= 0.0) continue;
         if (obs.freqIdx != 0) continue;
         if (obs.system == GnssSystem::GPS) gpsObsPrn.insert(obs.prn);
@@ -1069,7 +1079,8 @@ bool SPP::computeWithReport(double t_rx_gpst, const std::vector<ObsData>& obsLis
         return false;
     }
 
-    int required = (report.match_b > 0) ? 5 : 4;
+    const bool dual = (report.match_g > 0 && report.match_b > 0);
+    int required = dual ? 5 : 4;
     if (matchTotal < required) {
         report.attempted = false;
         report.ok = false;

@@ -16,6 +16,9 @@ output:
 runtime:
   enable_spp: true
   enable_sat_state: true
+  systems:
+    gps: true
+    bds: true
 
 spp:
   frequency_mode: DUAL_FREQ_IF
@@ -34,6 +37,6 @@ spp:
     beta: [0.0, 0.0, 0.0, 0.0]
 
 reference_ecef:
-  x: -2267804.5260
-  y: 5009342.3720
-  z: 3220991.8630
+  x: -2267810.1600
+  y: 5009324.1400
+  z: 3221016.6100

@@ -17,7 +17,8 @@ output/
 *.txt
 *.log
 *.SP3
-
+参考数据/
+报告撰写/
 #忽略绘图
 plot/
 *.png

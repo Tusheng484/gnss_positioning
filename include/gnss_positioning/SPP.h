@@ -221,6 +221,8 @@ public:
     void setEnableTroposphere(bool enable) { enable_tropo_ = enable; }
     void setEnableKlobucharIono(bool enable) { enable_klobuchar_ = enable; }
     void setEnableTgdCorrection(bool enable) { enable_tgd_ = enable; }
+    void setEnableGps(bool enable) { enable_gps_ = enable; }
+    void setEnableBds(bool enable) { enable_bds_ = enable; }
     void setGpsKlobucharParams(const double alpha[4], const double beta[4]);
     void setBdsKlobucharParams(const double alpha[4], const double beta[4]);
 
@@ -287,6 +289,7 @@ private:
      * @return 时间系统已统一后的星历
      */
     Ephemeris normalizeEphemerisToGpSt(const Ephemeris& eph) const;
+    bool isSystemEnabled(GnssSystem sys) const;
 
     /**
      * @brief 观测预处理与筛选（单星最佳观测选取与质量控制）
@@ -428,6 +431,8 @@ private:
     bool enable_tropo_ = true;
     bool enable_klobuchar_ = false;
     bool enable_tgd_ = true;
+    bool enable_gps_ = true;
+    bool enable_bds_ = true;
     bool has_gps_iono_ = false;
     bool has_bds_iono_ = false;
     double gps_alpha_[4] = {0.0, 0.0, 0.0, 0.0};
