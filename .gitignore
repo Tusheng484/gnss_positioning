@@ -1,26 +1,55 @@
+# 编辑器、缓存与本地验证目录
 .vscode/
-build/
-bin/
-third_party/eigen/
-*.21G
-*.21L
-Novatel OEM7 Data/
-opensky/
-*.rnx
-# 忽略编译产物
-build/
-bin/
+.idea/
+.cache/
+/work/
+.DS_Store
+Thumbs.db
+
+# CMake / C++ 构建产物
+/build/
+/build-*/
+/bin/
 *.exe
-*.py
-# 忽略解算输出和日志
-output/
-*.txt
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+
+# 第三方依赖：按 third_party/README.md 单独获取
+/third_party/eigen/
+
+# 本机配置和实验清单；仓库提供 params.example.yaml
+/config/params.yaml
+/config/*.local.yaml
+/config/comparison_manifest.json
+
+# Python 环境和缓存（保留源代码、requirements.txt）
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 课程原始数据、运行输出与本地提交材料
+/Novatel OEM7 Data/
+/opensky/
+/参考数据/
+/报告撰写/
+/提交文件夹/
+/output/
+/outputs/
+/data/*
+!/data/README.md
 *.log
+*.rnx
 *.SP3
-参考数据/
-报告撰写/
-#忽略绘图
-plot/
-*.png
-*.jpg
-*.jpeg
+*.21?
+*.obs
+*.nav
+
+# 未完整归档的批量绘图实验，依赖缺失的 plot/plot.py
+/plot/
+/report_batch_config_comparison.py

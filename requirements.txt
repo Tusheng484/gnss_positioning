@@ -1,0 +1,5 @@
+# 可选 Python 分析依赖；C++ 主程序不依赖 Python。
+numpy
+pandas
+matplotlib
+seaborn

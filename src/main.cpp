@@ -913,7 +913,7 @@ public:
             }
             return true;
         }
-        return socket_.open(cfg_.netIp(), cfg_.netPort(), 1000, error_message);
+        return socket_.open(cfg_.netIp(), cfg_.netPort(), 10000, error_message);
     }
 
     /**
@@ -1053,7 +1053,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (chunk.timed_out) continue;
-            if (chunk.source_closed) break;
+            if (chunk.source_closed) {
+                std::cerr << "[INFO] 连接关闭: " << read_error
+                          << " (已接收 " << total_bytes << " 字节, "
+                          << range_frames << " 历元)" << std::endl;
+                break;
+            }
 
             total_bytes += chunk.size;
             files.writeRawStream(chunk_buffer.data(), chunk.size);

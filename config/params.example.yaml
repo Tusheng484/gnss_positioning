@@ -1,9 +1,11 @@
+# 从仓库根目录运行，显式指定 --config=config/params.yaml。
+# 复制为 params.yaml 后修改路径和参考坐标；本机配置不提交到 Git。
 io:
-  input_mode: network
-  input_path: D:/gnss_positioning/Novatel OEM7 Data/01/NovatelOEM20211114-01.log
-  net_ip: 8.148.22.229
+  input_mode: file
+  input_path: data/NovatelOEM20211114-01.log
+  net_ip: 127.0.0.1
   net_port: 7003
-  output_dir: D:/gnss_positioning/output/network
+  output_dir: output/file
 
 output:
   terminal_output: true
@@ -36,7 +38,9 @@ spp:
     alpha: [0.0, 0.0, 0.0, 0.0]
     beta: [0.0, 0.0, 0.0, 0.0]
 
+# 替换为测站已知 ECEF 坐标（米）。全零时以首个成功解为参考，
+# 此时 ENU 为相对位移，不能用作绝对定位误差。
 reference_ecef:
-  x: -2267810.1600
-  y: 5009324.1400
-  z: 3221016.6100
+  x: 0.0
+  y: 0.0
+  z: 0.0
